@@ -8,6 +8,8 @@ import hashlib
 import uuid
 import datetime
 import yaml
+import argparse
+from pathlib import Path
 
 import aiosqlite
 import aiofiles
@@ -19,12 +21,17 @@ config = {
     # 'chunksize': 64*1024*1024,  # max object chunk size in S3 (64MB)
     'chunksize': 4*1024*1024,  # max object chunk size in S3 (4MB)
     'buffersize': 256*1024,  # buffer size for hash calculation (256KB)
+    's3_max': 1000,  # max number of S3 tasks
+    'db_max': 1000,  # max number of db tasks
+    'lb_max': 16,  # max number of tasks using large buffers
     'scan_counter': 0,  # initial value
+    # backup root directory (will be overwritten from bus3.yaml)
+    'root_dir': None,
+    'large_buffers': 0,  # Number of large buffers (up to chunksize) being used
+    'runmode': 0,  # 0: list history, 1: backup, 2: restore
 }
-root_dir = None
 processing_db = []  # list of paths to files/dirs
 processing_s3 = []  # list of paths to files
-large_buffers = 0  # Number of large buffers (up to chunksize) being used
 task_list = []  # task list
 
 logging.basicConfig(
@@ -114,9 +121,9 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
         file_path
         object_hash: will be object key name
         size: object size
-        contents: contents if size <= buffer size (ie, don't need to read file)
+        contents: full contents if size <= buffer size 
+                  (ie, don't need to read file again)
     """
-    global large_buffers
     processing_s3.append(file_path)
     async with aioboto3.client(
             's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
@@ -127,9 +134,9 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
             processing_s3.remove(file_path)
             return
 
-        while large_buffers >= 16:
+        while config['large_buffers'] >= config['lb_max']:
             await asyncio.sleep(1)
-        large_buffers += 1
+        config['large_buffers'] += 1
         logging.info(f"Grab a large buffer: {size}")
         large_buffer = bytearray(size)
         view = memoryview(large_buffer)
@@ -140,7 +147,7 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
             await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
         del view
         del large_buffer
-        large_buffers -= 1
+        config['large_buffers'] -= 1
     processing_s3.remove(file_path)
 
 
@@ -162,7 +169,8 @@ async def process_file(path, parent, fsid, islink):
         return
 
     logging.info(f"Processing file: {path}")
-    _, version_row_id, contents_changed = await set_dirent_version(path, parent, fsid, stat, "FILE")
+    _, version_row_id, contents_changed = \
+        await set_dirent_version(path, parent, fsid, stat, "FILE")
     if not contents_changed:  # no update to file contents?
         processing_db.remove(path)
         return
@@ -189,6 +197,7 @@ async def process_file(path, parent, fsid, islink):
                 cur = await db.cursor()
                 await cur.execute("SELECT * FROM ver_object WHERE object_hash=?",
                                   (object_hash,))
+                # find an ver_object_row -> same content object is in S3
                 ver_object_row = await cur.fetchone()
                 await cur.execute(
                     "INSERT INTO ver_object (ver_id, object_hash) VALUES (?, ?)",
@@ -219,8 +228,10 @@ async def process_dir(path, parent):
     dirent_row_id, _, _ = await set_dirent_version(path, parent, fsid, stat, "DIRECTORY")
     processing_db.remove(path)
 
+    # create tasks for dirs and files in the directory
     for dent in os.scandir(path):
-        while len(processing_db) > 1000 or len(processing_s3) > 1000:
+        while len(processing_db) > config['db_max'] \
+                or len(processing_s3) > config['s3_max']:
             await asyncio.sleep(1)
 
         if dent.is_file(follow_symlinks=False):
@@ -250,10 +261,11 @@ async def shutdown(signal, loop):
     loop.stop()
 
 
-async def async_main():
+async def async_backup():
     """
-    asynchronous main task
-    Create database tables, read config and kick the scan
+    asynchronous backup main task
+    Create database tables, kick the scan, wait for all tasks
+    and mark deleted files
     """
     async with aiosqlite.connect(config['db_file']) as db:
         cur = await db.cursor()
@@ -300,9 +312,9 @@ async def async_main():
         logging.info(f"scan_counter: {config['scan_counter']}")
         await cur.execute(
             "INSERT INTO scan (scan_counter, start_time, root_dir) VALUES (?, ?, ?)",
-            (config['scan_counter'], datetime.datetime.now(), root_dir))
+            (config['scan_counter'], datetime.datetime.now(), config['root_dir']))
         await db.commit()
-    task = asyncio.create_task(process_dir(root_dir, -1))
+    task = asyncio.create_task(process_dir(config['root_dir'], -1))
     task_list.append(task)
     await asyncio.sleep(2)  # wait a while for task_list to be populated
     await asyncio.gather(*task_list)
@@ -316,12 +328,52 @@ async def async_main():
         await db.commit()
 
 
+async def async_list():
+    """
+    asynchronous task to list backup history
+    """
+    db_file = Path(config['db_file'])
+    if not db_file.is_file:
+        logging.error(f"{config['db_file']} doesn't exist.  Aborting.")
+        return
+    async with aiosqlite.connect(config['db_file']) as db:
+        cur = await db.cursor()
+        await cur.execute("SELECT * FROM scan")
+        rows = await cur.fetchall()
+        print(f"  #: {'date & time'.ljust(19)} backup root directory")
+        for row in rows:
+            print(f"{row[0]:3d}: {row[1][:19]} {row[2]}")
+
+
 def main():
-    global root_dir
+    """
+    Parse command line, read config file and start event loop
+    """
+    parser = argparse.ArgumentParser(
+        description='Backup to S3 storage')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-l', '--list', action='store_true',
+                       help='list backup history')
+    group.add_argument('-b', '--backup', action='store_true',
+                       help='backup directory specified in bus3.yaml')
+    group.add_argument('-r', '--restore', action='store_true',
+                       help='restore')
+    args = parser.parse_args()
+    if args.backup:
+        config['runmode'] = 1  # backup
+    elif args.restore:
+        config['runmode'] = 2  # restore
+    else:
+        config['runmode'] = 0  # list backup history
+
+    conf_file = Path('bus3.yaml')
+    if not conf_file.is_file():
+        logging.error(f"bus3.yaml doesn't exist.  aborting.")
+        return
     with open("bus3.yaml", 'r') as f:
         loaded = yaml.safe_load(f)
     config.update(loaded['s3_config'])
-    root_dir = loaded['root_dir']
+    config['root_dir'] = loaded['root_dir']
     loop = asyncio.get_event_loop()
     signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
     for s in signals:
@@ -329,7 +381,12 @@ def main():
             s, lambda s=s: asyncio.create_task(shutdown(s, loop)))
 
     try:
-        task = loop.create_task(async_main())
+        if config['runmode'] == 0:
+            task = loop.create_task(async_list())
+        elif config['runmode'] == 1:
+            task = loop.create_task(async_backup())
+        else:
+            task = loop.create_task(async_restore())
         loop.run_until_complete(task)
     except KeyboardInterrupt:
         logging.info("Process interrupted")
