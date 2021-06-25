@@ -1,29 +1,29 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#org14bb7c0)
-    1.  [Overview](#org10c7d44)
-    2.  [Getting started](#orgab43aa1)
-        1.  [Prerequisites](#orgac83ede)
-        2.  [Installation](#org8dc4069)
-        3.  [Configuration file](#org01e5a06)
-        4.  [Usage](#orgcbaf2b7)
-2.  [License](#org5266f9b)
-3.  [Contact](#orgb055843)
-4.  [Acknowledgements](#orga4bdfec)
+1.  [bus3 - buckup to S3](#orgacf878d)
+    1.  [Overview](#org054e0c8)
+    2.  [Getting started](#org146452d)
+        1.  [Prerequisites](#orgd38c9ab)
+        2.  [Installation](#orgda9a5df)
+        3.  [Configuration file](#orgd77a3b0)
+        4.  [Usage](#orge34617d)
+2.  [License](#orgb1d9f4e)
+3.  [Contact](#orgd35389d)
+4.  [Acknowledgements](#orge864668)
 
 
 
-<a id="org14bb7c0"></a>
+<a id="orgacf878d"></a>
 
 # bus3 - buckup to S3
 
 `bus3.py` is a backup tool to S3 storage.  It fully utilizes `asyncio` to maximize concurrency.  It relies on `aiofiles`, `aiosqlite` and `aioboto3` libraries.
 
-**Important notice - bus3 is under development and may or may not work for now.  Especially, restore is not implemented yet!**
+**Important notice - bus3 is still under development (experimental) and may or may not work for now.  Especially, restore is not implemented yet!**
 
 
-<a id="org10c7d44"></a>
+<a id="org054e0c8"></a>
 
 ## Overview
 
@@ -42,12 +42,12 @@ bus3 is designed so that it is supposed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in database.  The database is also backed up to S3 storage.
 
 
-<a id="orgab43aa1"></a>
+<a id="org146452d"></a>
 
 ## Getting started
 
 
-<a id="orgac83ede"></a>
+<a id="orgd38c9ab"></a>
 
 ### Prerequisites
 
@@ -60,7 +60,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 -   bus3.yaml - config file
 
 
-<a id="org8dc4069"></a>
+<a id="orgda9a5df"></a>
 
 ### Installation
 
@@ -74,7 +74,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 8.  Run `python bus3.py -b` to backup
 
 
-<a id="org01e5a06"></a>
+<a id="orgd77a3b0"></a>
 
 ### Configuration file
 
@@ -86,15 +86,21 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="orgcbaf2b7"></a>
+<a id="orge34617d"></a>
 
 ### Usage
 
 To back up:
 
+    python bus3.py -b
+
 To see backup history/list:
 
+    python bus3.py [-l]
+
 To restore directory/file:
+
+    python bus3.py -r all|<file/dierctory-to-restore> <directory-to-be-restored> [-n <backup-history-number>]
 
 `<file/directory-to-restore>` can either be specified as a full path (ie, starts with `/`) or a relative path to the backup root directory sepcified in the `bus3.yaml`.  If `all` is specified, bus3 will restore all backup files and directories.
 
@@ -104,14 +110,14 @@ Note:
 If bus3.py doesn't find the database file (bus3.db) in the current directory when it performs a backup (`-b`), it will create a new one.  If bus3.py can't find the database file when it restores (`-r`) or loads backup history (`-l` or no option), it will try to restore the database file from S3 storage.
 
 
-<a id="org5266f9b"></a>
+<a id="orgb1d9f4e"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="orgb055843"></a>
+<a id="orgd35389d"></a>
 
 # Contact
 
@@ -120,7 +126,7 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="orga4bdfec"></a>
+<a id="orge864668"></a>
 
 # Acknowledgements
 
