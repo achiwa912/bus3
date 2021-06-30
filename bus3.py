@@ -436,6 +436,7 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     """
     async task to restore a file/directory/symlink version
     """
+    # get database info
     async with aiosqlite.connect(config['db_file']) as db:
         cur = await db.cursor()
         await cur.execute("SELECT * FROM dirent WHERE dent_id=?", (dir_id,))
@@ -449,6 +450,7 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
             await cur.execute("SELECT d.id, v.id, v.name, v.parent_id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=?", (ver_id,))
             children_rows = await cur.fetchall()
 
+    # download file contents
     fpath = os.path.join(restore_to, ver_row[2])
     if kind == Kind.FILE:
         async with aiofiles.open(fpath, mode='ab') as f:
@@ -466,15 +468,18 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     # set file attributes
     os.chmod(fpath, ver_row[7], follow_symlinks=False)
     os.chown(fpath, ver_row[8], ver_row[9], follow_symlinks=False)
+    os.utime(fpath, (ver_row[5], ver_row[6]), follow_symlinks=False)
     xattr_dict = eval(ver_row[11])
     for k, v in xattr_dict.items():
         os.setxattr(fpath, k, v, follow_symlinks=False)
 
+    # dispatch children tasks
     if kind == Kind.DIRECTORY:
         for child_row in children_rows:
-            asyncio.create_task(restore_obj(
+            task = asyncio.create_task(restore_obj(
                 os.path.join(fpath, child_row[2]), child_row[0],
                 child_row[1], child_row[3], Kind[child_row[4]]))
+            task_list.append(task)
 
 
 async def async_restore():
@@ -520,6 +525,9 @@ async def async_restore():
         task = asyncio.create_task(
             restore_obj(config['restore_to'], dirent_id, version_id,
                         parent_id, kind))
+        task_list.append(task)
+        await asyncio.sleep(2)
+        await asyncio.gather(*task_list)
 
 
 def main():
@@ -585,12 +593,16 @@ def main():
     try:
         if config['runmode'] == RunMode.LIST_HISTORY:
             task = loop.create_task(async_list())
+            task_list.append(task)
         elif config['runmode'] == RunMode.BACKUP:
             task = loop.create_task(async_backup())
-        elif config['runmode'] == RunMode.RESTORE_B:
+            task_list.append(task)
+        elif config['runmode'] == RunMode.RESTORE_DB:
             task = loop.create_task(async_restoredb())
+            task_list.append(task)
         else:
             task = loop.create_task(async_restore())
+            task_list.append(task)
         loop.run_until_complete(task)
     except KeyboardInterrupt:
         logging.info("Process interrupted")

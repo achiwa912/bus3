@@ -1,20 +1,20 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#orgacf878d)
-    1.  [Overview](#org054e0c8)
-    2.  [Getting started](#org146452d)
-        1.  [Prerequisites](#orgd38c9ab)
-        2.  [Installation](#orgda9a5df)
-        3.  [Configuration file](#orgd77a3b0)
-        4.  [Usage](#orge34617d)
-2.  [License](#orgb1d9f4e)
-3.  [Contact](#orgd35389d)
-4.  [Acknowledgements](#orge864668)
+1.  [bus3 - buckup to S3](#org2104ddb)
+    1.  [Overview](#orgf2d25ee)
+    2.  [Getting started](#org875a059)
+        1.  [Prerequisites](#org5806d3e)
+        2.  [Installation](#org9885e56)
+        3.  [Configuration file](#orgc059464)
+        4.  [Usage](#orgb165433)
+2.  [License](#org0aecf00)
+3.  [Contact](#org850dc92)
+4.  [Acknowledgements](#org8cdba97)
 
 
 
-<a id="orgacf878d"></a>
+<a id="org2104ddb"></a>
 
 # bus3 - buckup to S3
 
@@ -23,7 +23,7 @@
 **Important notice - bus3 is still under development (experimental) and may or may not work for now.  Especially, restore is not implemented yet!**
 
 
-<a id="org054e0c8"></a>
+<a id="orgf2d25ee"></a>
 
 ## Overview
 
@@ -42,12 +42,12 @@ bus3 is designed so that it is supposed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in database.  The database is also backed up to S3 storage.
 
 
-<a id="org146452d"></a>
+<a id="org875a059"></a>
 
 ## Getting started
 
 
-<a id="orgd38c9ab"></a>
+<a id="org5806d3e"></a>
 
 ### Prerequisites
 
@@ -60,7 +60,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 -   bus3.yaml - config file
 
 
-<a id="orgda9a5df"></a>
+<a id="org9885e56"></a>
 
 ### Installation
 
@@ -74,7 +74,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 8.  Run `python bus3.py -b` to backup
 
 
-<a id="orgd77a3b0"></a>
+<a id="orgc059464"></a>
 
 ### Configuration file
 
@@ -86,7 +86,7 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="orge34617d"></a>
+<a id="orgb165433"></a>
 
 ### Usage
 
@@ -98,26 +98,43 @@ To see backup history/list:
 
     python bus3.py [-l]
 
+Example output:
+
+    (bus3) [test@localhost bus3]$ python bus3.py -l
+      #: date & time         backup root directory
+      0: 2021-06-24 15:31:01 /home/test/py/bus3/test
+      1: 2021-06-24 15:57:25 /home/test/py/bus3/test
+      2: 2021-06-24 16:26:53 /home/test/py/bus3/test
+      3: 2021-06-24 22:34:11 /home/test/py/bus3/test
+      4: 2021-06-25 07:26:45 /home/test/py/bus3/test
+      5: 2021-06-25 07:31:05 /home/test/py/bus3/test
+      6: 2021-06-25 07:41:52 /home/test/py/bus3/test
+    07:46:42,292 INFO: Completed or gracefully terminated
+
 To restore directory/file:
 
-    python bus3.py -r all|<file/dierctory-to-restore> <directory-to-be-restored> [-n <backup-history-number>]
+    python bus3.py -r all|<file/dierctory-to-restore> <directory-to-be-restored> [<backup-history-number>]
 
 `<file/directory-to-restore>` can either be specified as a full path (ie, starts with `/`) or a relative path to the backup root directory sepcified in the `bus3.yaml`.  If `all` is specified, bus3 will restore all backup files and directories.
 
-If `-n <backup-history-number>` is not specified, bus3 will restore the latest version.
+If `<backup-history-number>` is not specified, bus3 will restore the latest version.
+
+To restore database file:
+
+    python bus3.py --restore_database
 
 Note:
-If bus3.py doesn't find the database file (bus3.db) in the current directory when it performs a backup (`-b`), it will create a new one.  If bus3.py can't find the database file when it restores (`-r`) or loads backup history (`-l` or no option), it will try to restore the database file from S3 storage.
+If bus3.py doesn't find the database file (bus3.db) in the current directory when it performs a backup (`-b`), it will create a new one.
 
 
-<a id="orgb1d9f4e"></a>
+<a id="org0aecf00"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="orgd35389d"></a>
+<a id="org850dc92"></a>
 
 # Contact
 
@@ -126,7 +143,7 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="orge864668"></a>
+<a id="org8cdba97"></a>
 
 # Acknowledgements
 
