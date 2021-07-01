@@ -333,7 +333,7 @@ async def async_backup():
             ctime timestamp NOT NULL,
             mtime timestamp NOT NULL,
             atime timestamp NOT NULL,
-            permission text NOT NULL,
+            permission integer NOT NULL,
             uid integer NOT NULL,
             gid integer NOT NULL,
             link_path text,
@@ -413,10 +413,15 @@ async def async_restoredb():
     async with aioboto3.resource(
             's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
         bucket = await s3.Bucket(config['s3_bucket'])
-        dbbkup_objs = await bucket.objects.filter(
+        dbbkup_objs = bucket.objects.filter(
             Prefix=config['db_file'])
-    sorted_dbbkups = sorted(name[len(config['db_file']+1):]
-                            for name in dbbkup_objs)
+        sorted_dbbkups = []
+        async for name in dbbkup_objs:
+            logging.info(f"name: {str(name)}")
+            name = name.key
+            sorted_dbbkups.append(name[len(config['db_file'])+1:])
+    sorted_dbbkups.sort()
+    logging.info(f"sorted_dbbkups - {sorted_dbbkups}")
     try:
         file_name = '_'.join([config['db_file'],
                               sorted_dbbkups[config['dbrestore_rel']-1]])
@@ -428,6 +433,7 @@ async def async_restoredb():
         try:
             await s3.download_file(
                 config['s3_bucket'], file_name, config['db_file'])
+            logging.info(f"restored databae: {file_name}")
         except:
             logging.error(f"Can't download {file_name}")
 
@@ -439,9 +445,9 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     # get database info
     async with aiosqlite.connect(config['db_file']) as db:
         cur = await db.cursor()
-        await cur.execute("SELECT * FROM dirent WHERE dent_id=?", (dir_id,))
+        await cur.execute("SELECT * FROM dirent WHERE id=?", (dent_id,))
         dent_row = await cur.fetchone()
-        await cur.execute("SELECT * FROM version WHERE ver_id=?", (ver_id,))
+        await cur.execute("SELECT * FROM version WHERE id=?", (ver_id,))
         ver_row = await cur.fetchone()
         await cur.execute("SELECT * FROM ver_object WHERE ver_id=?",
                           (ver_id,))
@@ -452,32 +458,74 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
 
     # download file contents
     fpath = os.path.join(restore_to, ver_row[2])
+    logging.info(f"fpath: {fpath}")
     if kind == Kind.FILE:
-        async with aiofiles.open(fpath, mode='ab') as f:
+        remaining_size = ver_row[3]  # file size
+        async with aiofiles.open(fpath, mode='wb') as f:
             # download file contents
             async with aioboto3.client(
                     's3', endpoint_url=config['s3_endpoint'],
                     verify=False) as s3:
+                logging.info(
+                    f"S3 loading bucket {config['s3_bucket']} to {fpath}")
+                bufsize = remaining_size
+                if remaining_size > config['chunksize']:
+                    bufsize = config['chunksize']
+                large_flag = False
+                if bufsize >= config['chunksize']//16:
+                    large_flag = True
+                if large_flag:
+                    while config['large_buffers'] >= config['lb_max']:
+                        await asyncio.sleep(1)
+                    config['large_buffers'] += 1
+                large_buffer = bytearray(bufsize)
+                view = memoryview(large_buffer)
                 for verobj in verobjs:
-                    await s3.download_fileobj(config['s3_bucket'], verobj[1], f)
+                    logging.info(f"verobj: {verobj[1]}")
+                    fi = io.BytesIO(view)
+                    await s3.download_fileobj(
+                        config['s3_bucket'], verobj[1], fi)
+                    if remaining_size >= bufsize:
+                        await f.write(view)
+                    else:
+                        await f.write(view[:remaining_size])
+                    remaining_size -= bufsize
+                del view
+                del large_buffer
+                if large_flag:
+                    config['large_buffers'] -= 1
     elif kind == Kind.DIRECTORY:
-        await aiofiles.mkdir(fpath, ver_row[7])
+        logging.info(f"mkdir {fpath}")
+        try:
+            await aiofiles.os.mkdir(fpath, ver_row[7])
+            #os.mkdir(fpath, ver_row[7])
+        except FileExistsError:
+            pass
+        #logging.info(f"mkdir {fpath} done")
     else:  # Kind.SYMLINK
-        await aiofiles.link(fpath, ver_row[10], follow_symlinks=False)
+        logging.info(f"Creating symlink: {fpath} to {ver_row[10]}")
+        os.symlink(ver_row[10], fpath)
 
     # set file attributes
-    os.chmod(fpath, ver_row[7], follow_symlinks=False)
+    if kind != Kind.SYMLINK:
+        os.chmod(fpath, ver_row[7], follow_symlinks=False)
+    #logging.info(f"chmod done")
     os.chown(fpath, ver_row[8], ver_row[9], follow_symlinks=False)
+    #logging.info(f"chown done")
     os.utime(fpath, (ver_row[5], ver_row[6]), follow_symlinks=False)
+    #logging.info(f"set a/mtime done")
     xattr_dict = eval(ver_row[11])
+    #logging.info(f"xattr - {xattr_dict}")
     for k, v in xattr_dict.items():
         os.setxattr(fpath, k, v, follow_symlinks=False)
+    #logging.info(f"Set attributes done.")
 
     # dispatch children tasks
     if kind == Kind.DIRECTORY:
         for child_row in children_rows:
+            logging.info(f"Dispatching child: {child_row[2]}")
             task = asyncio.create_task(restore_obj(
-                os.path.join(fpath, child_row[2]), child_row[0],
+                fpath, child_row[0],
                 child_row[1], child_row[3], Kind[child_row[4]]))
             task_list.append(task)
 
@@ -492,35 +540,47 @@ async def async_restore():
         return
 
     # Check restore-to directory
-    if not Path(config['restore_to']).is_dir(follow_symlinks=False):
+    if not os.path.isdir(config['restore_to']):
         logging.error(
             f"{config['restore_to']} directory doesn't exist.  aborting.")
         return
 
+    logging.info(f"restore-to: {config['restore_to']}")
+
     async with aiosqlite.connect(config['db_file']) as db:
-        cur = await cur.db.cursor()
+        cur = await db.cursor()
         restore_target = config['restore_target']
 
         # convert restore_target to relative from root_dir
-        await cur.execute("SELECT root_dir FROM scan ORDER BY scan_counter DESC;")
+        await cur.execute(
+            "SELECT root_dir FROM scan ORDER BY scan_counter DESC;")
         row = await cur.fetchone()
         if config['restore_target'].startswith(row[0]):
             restore_target = restore_target.replace(row[0], '')
+        if config['restore_target'] == 'all':
+            restore_target = ''
+
+        logging.info(f"restore-target: {restore_target}")
 
         # traverse path
         plist = restore_target.split('/')
         parent_id = -1  # root_dir
+        await cur.execute(
+            "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND d.is_deleted=0 AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
+        row = await cur.fetchone()
         for pitem in plist[:-1]:
+            parent_id = row[1]
             await cur.execute(
-                "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=?, d.is_deleted=0, v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
+                "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND d.is_deleted=0 AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
             row = await cur.fetchone()
+            logging.info(f"row tup - {row}")
             if not row:
                 logging.error(
                     f"No such file or directory: {config['restore_target']}")
                 return
-            parent_id = row[1]
         dirent_id, version_id, kind = row
         kind = Kind[kind]  # convert to Enum.Kind
+        logging.info(f"dent {dirent_id}, ver {version_id}, kind {kind}")
 
         task = asyncio.create_task(
             restore_obj(config['restore_to'], dirent_id, version_id,
@@ -542,35 +602,37 @@ def main():
     group.add_argument('-b', '--backup', action='store_true',
                        help='backup directory specified in bus3.yaml')
     group.add_argument('-r', '--restore', nargs='*',
-                       help='restore')
-    group.add_argument('--restore_database', nargs='?',
+                       help='restore all|<directory/file-to-restore> to <directory-to-restore-to>')
+    group.add_argument('-R', '--restore_db', nargs='?', const='0',
                        help='restore database file')
     args = parser.parse_args()
+    #logging.info(f"{args}, {args.restore_db}")
     if args.backup:
         config['runmode'] = RunMode.BACKUP  # backup
-    elif args.restore or args.restore == []:
+    elif args.restore or args.restore == '0':
         config['runmode'] = RunMode.RESTORE  # restore
         if 2 <= len(args.restore) <= 3:
             config['restore_target'] = args.restore[0]
-            config['restore_to'] = args.restore[1]
+            config['restore_to'] = os.path.abspath(args.restore[1])
             if len(args.restore) == 3:
                 config['restore_version'] = args.restore[2]
             else:
                 config['restore_version'] = sys.maxsize
         else:
             print(
-                f"Usage: bus3.py -r <directory/file-to-restore> <directory-to-restore-to> [<bakup history number>]")
+                f"Usage: bus3.py -r all|<directory/file-to-restore> <directory-to-restore-to> [<bakup history number>]")
             return
-    elif args.restore_database or args.restore_database == []:
+    elif args.restore_db or args.restore_db == '0':
         config['runmode'] = RunMode.RESTORE_DB  # restore database file
-        if len(restore_database) == 1:
-            try:
-                config['dbrestore_rel'] = int(restore_database[0])
-                eval(config['dbrestore_rel'] < 0)
-            except:
-                print(
-                    f"Usage: bus3.py --restore-database [# (eg, -1, -2, etc.)]")
-                return
+        #logging.info(f"restore_db - {args.restore_db}")
+        try:
+            config['dbrestore_rel'] = int(args.restore_db)
+            assert(config['dbrestore_rel'] <= 0)
+        except:
+            print(
+                f"Usage: bus3.py --restore_db <num from latest (0,-1..)>")
+            return
+        #logging.info(f"dbrestore_rel - {config['dbrestore_rel']}")
     else:
         config['runmode'] = RunMode.LIST_HISTORY  # list backup history
 
@@ -593,16 +655,12 @@ def main():
     try:
         if config['runmode'] == RunMode.LIST_HISTORY:
             task = loop.create_task(async_list())
-            task_list.append(task)
         elif config['runmode'] == RunMode.BACKUP:
             task = loop.create_task(async_backup())
-            task_list.append(task)
         elif config['runmode'] == RunMode.RESTORE_DB:
             task = loop.create_task(async_restoredb())
-            task_list.append(task)
         else:
             task = loop.create_task(async_restore())
-            task_list.append(task)
         loop.run_until_complete(task)
     except KeyboardInterrupt:
         logging.info("Process interrupted")
