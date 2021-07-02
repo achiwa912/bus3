@@ -1,20 +1,20 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#org2104ddb)
-    1.  [Overview](#orgf2d25ee)
-    2.  [Getting started](#org875a059)
-        1.  [Prerequisites](#org5806d3e)
-        2.  [Installation](#org9885e56)
-        3.  [Configuration file](#orgc059464)
-        4.  [Usage](#orgb165433)
-2.  [License](#org0aecf00)
-3.  [Contact](#org850dc92)
-4.  [Acknowledgements](#org8cdba97)
+1.  [bus3 - buckup to S3](#orgc8d5ed7)
+    1.  [Overview](#org3c91971)
+    2.  [Getting started](#org064c15d)
+        1.  [Prerequisites](#org2cd3ef7)
+        2.  [Installation](#orgb92cee0)
+        3.  [Configuration file](#org72945a1)
+        4.  [Usage](#org8d33daf)
+2.  [License](#org9fd4f33)
+3.  [Contact](#org7ac65b1)
+4.  [Acknowledgements](#orgd8ed78a)
 
 
 
-<a id="org2104ddb"></a>
+<a id="orgc8d5ed7"></a>
 
 # bus3 - buckup to S3
 
@@ -23,7 +23,7 @@
 **Important notice - bus3 is still under development (experimental) and may or may not work for now.  Especially, restore is not implemented yet!**
 
 
-<a id="orgf2d25ee"></a>
+<a id="org3c91971"></a>
 
 ## Overview
 
@@ -42,12 +42,12 @@ bus3 is designed so that it is supposed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in database.  The database is also backed up to S3 storage.
 
 
-<a id="org875a059"></a>
+<a id="org064c15d"></a>
 
 ## Getting started
 
 
-<a id="org5806d3e"></a>
+<a id="org2cd3ef7"></a>
 
 ### Prerequisites
 
@@ -60,7 +60,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 -   bus3.yaml - config file
 
 
-<a id="org9885e56"></a>
+<a id="orgb92cee0"></a>
 
 ### Installation
 
@@ -74,7 +74,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 8.  Run `python bus3.py -b` to backup
 
 
-<a id="orgc059464"></a>
+<a id="org72945a1"></a>
 
 ### Configuration file
 
@@ -86,7 +86,7 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="orgb165433"></a>
+<a id="org8d33daf"></a>
 
 ### Usage
 
@@ -111,6 +111,8 @@ Example output:
       6: 2021-06-25 07:41:52 /home/test/py/bus3/test
     07:46:42,292 INFO: Completed or gracefully terminated
 
+`#` is the backup history number (or scan counter)
+
 To restore directory/file:
 
     python bus3.py -r all|<file/dierctory-to-restore> <directory-to-be-restored> [<backup-history-number>]
@@ -121,20 +123,22 @@ If `<backup-history-number>` is not specified, bus3 will restore the latest vers
 
 To restore database file:
 
-    python bus3.py --restore_database
+    python bus3.py --restore_database [<negative number>]
+
+`<negative number>` is -1, -2, etc. and indicates relative version number from the latest.  For example, '-1' is the 2nd latest and '-2' is the 3rd latest.
 
 Note:
 If bus3.py doesn't find the database file (bus3.db) in the current directory when it performs a backup (`-b`), it will create a new one.
 
 
-<a id="org0aecf00"></a>
+<a id="org9fd4f33"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="org850dc92"></a>
+<a id="org7ac65b1"></a>
 
 # Contact
 
@@ -143,7 +147,7 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="org8cdba97"></a>
+<a id="orgd8ed78a"></a>
 
 # Acknowledgements
 
