@@ -1,4 +1,5 @@
 import os
+import errno
 import sys
 import io
 import asyncio
@@ -89,7 +90,7 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         if kind == Kind.SYMLINK:
             link_path = os.readlink(path)
         await cur.execute(
-            "SELECT * FROM version WHERE dirent_id=? AND is_latest=1",
+            "SELECT * FROM version WHERE dirent_id=? ORDER BY id DESC",
             (dirent_row_id, ))
         version_row = await cur.fetchone()
         if not version_row:
@@ -98,7 +99,7 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
             await cur.execute(
-                "INSERT INTO version (id, is_latest, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO version (id, is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (None, os.path.basename(path), stat.st_size,
                  stat.st_ctime, stat.st_mtime, stat.st_atime,
                  stat.st_mode, stat.st_uid, stat.st_gid, link_path,
@@ -113,10 +114,7 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
             await cur.execute(
-                "UPDATE version SET is_latest=0 WHERE id=?",
-                (cur.lastrowid,))
-            await cur.execute(
-                "INSERT INTO version (id, is_latest, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO version (id, is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (None, os.path.basename(path), stat.st_size,
                  stat.st_ctime, stat.st_mtime, stat.st_atime,
                  stat.st_mode, stat.st_uid, stat.st_gid, link_path,
@@ -144,7 +142,6 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
     async with aioboto3.client(
             's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
         if size <= config['buffersize']:
-            # logging.info(contents.decode('utf-8'))
             fo = io.BytesIO(contents)
             await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
             processing_s3.remove(file_path)
@@ -327,7 +324,7 @@ async def async_backup():
             );""")
         await cur.execute("""CREATE TABLE IF NOT EXISTS version (
             id integer PRIMARY KEY,
-            is_latest integer NOT NULL,
+            is_delmarker integer NOT NULL,
             name text NOT NULL,
             size integer NOT NULL,
             ctime timestamp NOT NULL,
@@ -364,15 +361,27 @@ async def async_backup():
         await db.commit()
     task = asyncio.create_task(process_dir(config['root_dir'], -1))
     task_list.append(task)
-    await asyncio.sleep(2)  # wait a while for task_list to be populated
+    await asyncio.sleep(1)  # wait a while for task_list to be populated
     await asyncio.gather(*task_list)
 
-    # Mark deleted files
+    # Take care of deleted files and directories
     async with aiosqlite.connect(config['db_file']) as db:
         cur = await db.cursor()
-        await cur.execute(
-            "UPDATE dirent SET is_deleted = 1 WHERE scan_counter < ?",
-            (config['scan_counter'], ))
+
+        # mark dirent as deleted
+        await cur.execute("SELECT id FROM dirent WHERE is_deleted = 0 AND scan_counter < ?", (config['scan_counter'],))
+        dent_rows = await cur.fetchall()
+        for dent_row in dent_rows:
+            logging.info(f"{dent_row}")
+            await cur.execute("UPDATE dirent SET is_deleted = 1 WHERE id = ?", (dent_row[0],))
+
+            # Insert delete marker version
+            await cur.execute("SELECT * FROM version WHERE dirent_id=? ORDER BY id DESC", (dent_row[0],))
+            r = await cur.fetchone()
+            if r[1] != 1:  # is_delmarker
+                logging.info(f"delete row - {r}")
+                await cur.execute("INSERT INTO version (id, is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, dirent_id, scan_counter, parent_id) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (None, r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[12], config['scan_counter'], r[14]))
+
         await db.commit()
 
     # backup db file to S3
@@ -443,6 +452,7 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     async task to restore a file/directory/symlink version
     """
     # get database info
+    processing_db.append(ver_id)
     async with aiosqlite.connect(config['db_file']) as db:
         cur = await db.cursor()
         await cur.execute("SELECT * FROM dirent WHERE id=?", (dent_id,))
@@ -453,13 +463,16 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                           (ver_id,))
         verobjs = await cur.fetchall()
         if kind == Kind.DIRECTORY:
-            await cur.execute("SELECT d.id, v.id, v.name, v.parent_id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=?", (ver_id,))
+            # Get children to dispatch
+            await cur.execute("SELECT d.id, v.id, v.name, v.parent_id, d.type, v.is_delmarker, MAX(v.scan_counter) FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE (SELECT dirent_id FROM version WHERE id = v.parent_id) = ? AND v.scan_counter <= ? GROUP BY v.name ORDER BY v.scan_counter DESC", (dent_id, config['restore_version']))
             children_rows = await cur.fetchall()
+    processing_db.remove(ver_id)
 
     # download file contents
+    processing_s3.append(ver_id)
     fpath = os.path.join(restore_to, ver_row[2])
-    logging.info(f"fpath: {fpath}")
     if kind == Kind.FILE:
+        logging.info(f"fpath: {fpath}")
         remaining_size = ver_row[3]  # file size
         async with aiofiles.open(fpath, mode='wb') as f:
             # download file contents
@@ -474,7 +487,6 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                 large_flag = False
                 if bufsize >= config['chunksize']//16:
                     large_flag = True
-                if large_flag:
                     while config['large_buffers'] >= config['lb_max']:
                         await asyncio.sleep(1)
                     config['large_buffers'] += 1
@@ -485,44 +497,52 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                     fi = io.BytesIO(view)
                     await s3.download_fileobj(
                         config['s3_bucket'], verobj[1], fi)
-                    if remaining_size >= bufsize:
-                        await f.write(view)
+                    fi.seek(0)
+                    if remaining_size <= bufsize:
+                        await f.write(fi.read(remaining_size))
                     else:
-                        await f.write(view[:remaining_size])
+                        await f.write(fi.read(bufsize))
                     remaining_size -= bufsize
                 del view
                 del large_buffer
                 if large_flag:
                     config['large_buffers'] -= 1
+        processing_s3.remove(ver_id)
     elif kind == Kind.DIRECTORY:
         logging.info(f"mkdir {fpath}")
         try:
             await aiofiles.os.mkdir(fpath, ver_row[7])
-            #os.mkdir(fpath, ver_row[7])
         except FileExistsError:
             pass
-        #logging.info(f"mkdir {fpath} done")
     else:  # Kind.SYMLINK
         logging.info(f"Creating symlink: {fpath} to {ver_row[10]}")
-        os.symlink(ver_row[10], fpath)
+        try:
+            os.symlink(ver_row[10], fpath)
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                os.remove(fpath)
+                os.symlink(ver_row[10], fpath)
 
-    # set file attributes
+    # set file/directory attributes
     if kind != Kind.SYMLINK:
+        # This will cause an exception for a symlink
         os.chmod(fpath, ver_row[7], follow_symlinks=False)
-    #logging.info(f"chmod done")
     os.chown(fpath, ver_row[8], ver_row[9], follow_symlinks=False)
-    #logging.info(f"chown done")
     os.utime(fpath, (ver_row[5], ver_row[6]), follow_symlinks=False)
-    #logging.info(f"set a/mtime done")
     xattr_dict = eval(ver_row[11])
-    #logging.info(f"xattr - {xattr_dict}")
     for k, v in xattr_dict.items():
         os.setxattr(fpath, k, v, follow_symlinks=False)
-    #logging.info(f"Set attributes done.")
 
     # dispatch children tasks
     if kind == Kind.DIRECTORY:
+        while len(processing_db) > config['db_max'] \
+                or len(processing_s3) > config['s3_max']:
+            await asyncio.sleep(1)
+
+        logging.info(f"Will dispatch children: {children_rows}")
         for child_row in children_rows:
+            if child_row[5] == 1:  # is_delmarker
+                continue
             logging.info(f"Dispatching child: {child_row[2]}")
             task = asyncio.create_task(restore_obj(
                 fpath, child_row[0],
@@ -566,12 +586,12 @@ async def async_restore():
         plist = restore_target.split('/')
         parent_id = -1  # root_dir
         await cur.execute(
-            "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND d.is_deleted=0 AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
+            "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
         row = await cur.fetchone()
         for pitem in plist[:-1]:
-            parent_id = row[1]
+            parent_id = row[0]
             await cur.execute(
-                "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND d.is_deleted=0 AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
+                "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
             row = await cur.fetchone()
             logging.info(f"row tup - {row}")
             if not row:
@@ -580,13 +600,13 @@ async def async_restore():
                 return
         dirent_id, version_id, kind = row
         kind = Kind[kind]  # convert to Enum.Kind
-        logging.info(f"dent {dirent_id}, ver {version_id}, kind {kind}")
+        #logging.info(f"dent {dirent_id}, ver {version_id}, kind {kind}")
 
         task = asyncio.create_task(
             restore_obj(config['restore_to'], dirent_id, version_id,
                         parent_id, kind))
         task_list.append(task)
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         await asyncio.gather(*task_list)
 
 
