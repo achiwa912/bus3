@@ -24,9 +24,11 @@ config = {
     # 'chunksize': 64*1024*1024,  # max object chunk size in S3 (64MB)
     'chunksize': 4*1024*1024,  # max object chunk size in S3 (4MB; for testing)
     'buffersize': 256*1024,  # buffer size for hash calculation (256KB)
-    's3_max': 1000,  # max number of S3 tasks
-    'db_max': 1000,  # max number of db tasks
+    's3_max': 100,  # max number of S3 tasks
+    'db_max': 64,  # max number of db tasks
     'lb_max': 16,  # max number of tasks using large buffers
+    'restore_max': 96,  # max concurrent restore tasks
+    'sqlite_timeout': 180,  # timeout value
     # global temp variables from here:
     'scan_counter': 1,  # initial value
     'root_dir': None,  # backup root directory (will be overwritten)
@@ -36,6 +38,10 @@ config = {
     'restore_target': None,  # file or folder to restore
     'restore_to': None,  # restore to directory
     'restore_version': 0,  # optional restore version
+    'num_tasks': 0,  # number of tasks
+    'processed_files': 0,  # number of processed files
+    'start_time': 0,
+    'end_time': 0,
 }
 processing_db = []  # list of paths to files/dirs
 processing_s3 = []  # list of paths to files
@@ -64,7 +70,7 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         version_row_id: version id if created.  -1 if not
         contents_changed: True if file contents changed
     """
-    async with aiosqlite.connect(config['db_file']) as db:
+    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
         cur = await db.cursor()
 
         # dirent table
@@ -162,6 +168,8 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
         del large_buffer
         config['large_buffers'] -= 1
     processing_s3.remove(file_path)
+    logging.info(
+        f"Processed s3 write: {file_path} (db:{len(processing_db)},s3:{len(processing_s3)})")
 
 
 async def process_file(path, parent, fsid, islink):
@@ -173,19 +181,22 @@ async def process_file(path, parent, fsid, islink):
         fsid: filesystem id
         islink: True if symbolic link
     """
-    stat = await aiofiles.os.stat(path, follow_symlinks=False)
     processing_db.append(path)
+    logging.info(
+        f"Processing file started: (db:{len(processing_db)},s3:{len(processing_s3)})")
+    stat = await aiofiles.os.stat(path, follow_symlinks=False)
     if islink:  # symbolic link
-        logging.info(f"Processing symlink: {path}")
         await set_dirent_version(path, parent, fsid, stat, Kind.SYMLINK)
         processing_db.remove(path)
+        logging.info(f"Processed symlink: {path}")
         return
 
-    logging.info(f"Processing file: {path}")
+    version_wor_id, contents_changed = 1, True
     _, version_row_id, contents_changed = \
         await set_dirent_version(path, parent, fsid, stat, Kind.FILE)
     if not contents_changed:  # no update to file contents?
         processing_db.remove(path)
+        config['num_tasks'] -= 1
         return
 
     chunksize = config['chunksize']
@@ -206,7 +217,7 @@ async def process_file(path, parent, fsid, islink):
                 hash_val.update(contents)
                 prev_contents = contents
             object_hash = hash_val.hexdigest()
-            async with aiosqlite.connect(config['db_file']) as db:
+            async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
                 cur = await db.cursor()
                 await cur.execute("SELECT * FROM ver_object WHERE object_hash=?",
                                   (object_hash,))
@@ -224,6 +235,10 @@ async def process_file(path, parent, fsid, islink):
                 break
             chunk_index += 1
     processing_db.remove(path)
+    logging.info(
+        f"Processed file: (db:{len(processing_db)},s3:{len(processing_s3)})")
+    config['num_tasks'] -= 1
+    config['processed_files'] += 1
 
 
 async def process_dir(path, parent):
@@ -233,7 +248,6 @@ async def process_dir(path, parent):
         path: directory path name
         parent: parent version row id (-1 if top)
     """
-    logging.info(f"Processing dir: {path}")
     # Check if it's in the DB and if updated
     processing_db.append(path)
     fsid = str(os.statvfs(path).f_fsid)  # not async
@@ -249,6 +263,9 @@ async def process_dir(path, parent):
             await asyncio.sleep(1)
 
         if dent.is_file(follow_symlinks=False):
+            config['num_tasks'] += 1
+            while config['num_tasks'] > config['db_max']:
+                await asyncio.sleep(2)
             task = asyncio.create_task(
                 process_file(dent.path, version_row_id, fsid, False))
             task_list.append(task)
@@ -262,6 +279,7 @@ async def process_dir(path, parent):
             task_list.append(task)
         else:
             logging.info(f"Not file or dir: {dent.path}  Skipped")
+    logging.info(f"Processed dir: {path}")
 
 
 async def shutdown(signal, loop):
@@ -312,7 +330,7 @@ async def async_backup():
     if not healthy:
         return
 
-    async with aiosqlite.connect(config['db_file']) as db:
+    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
         cur = await db.cursor()
         await cur.execute("""CREATE TABLE IF NOT EXISTS dirent (
             id integer PRIMARY KEY,
@@ -322,6 +340,7 @@ async def async_backup():
             inode integer NOT NULL,
             scan_counter integer NOT NULL
             );""")
+        await cur.execute("CREATE INDEX Dentidx1 ON dirent(fsid, inode);")
         await cur.execute("""CREATE TABLE IF NOT EXISTS version (
             id integer PRIMARY KEY,
             is_delmarker integer NOT NULL,
@@ -340,11 +359,14 @@ async def async_backup():
             parent_id integer NOT NULL,
             FOREIGN KEY (dirent_id) REFERENCES dirent (id)
             );""")
+        await cur.execute("CREATE INDEX Veridx1 ON version(dirent_id);")
         await cur.execute("""CREATE TABLE IF NOT EXISTS ver_object (
             ver_id integer NOT NULL,
             object_hash text NOT NULL,
             FOREIGN KEY (ver_id) REFERENCES version (id)
             );""")
+        await cur.execute("CREATE INDEX Voidx1 ON ver_object(ver_id);")
+        await cur.execute("CREATE INDEX Voidx2 ON ver_object(object_hash);")
         await cur.execute("""CREATE TABLE IF NOT EXISTS scan (
             scan_counter integer PRIMARY KEY,
             start_time timestamp NOT NULL,
@@ -365,7 +387,7 @@ async def async_backup():
     await asyncio.gather(*task_list)
 
     # Take care of deleted files and directories
-    async with aiosqlite.connect(config['db_file']) as db:
+    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
         cur = await db.cursor()
 
         # mark dirent as deleted
@@ -392,6 +414,8 @@ async def async_backup():
         await s3.upload_file(
             config['db_file'], config['s3_bucket'], obj_name)
 
+    await asyncio.sleep(5)
+
 
 async def async_list():
     """
@@ -400,7 +424,7 @@ async def async_list():
     healthy = await check_db()
     if not healthy:
         return
-    async with aiosqlite.connect(config['db_file']) as db:
+    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
         cur = await db.cursor()
         await cur.execute("SELECT * FROM scan")
         rows = await cur.fetchall()
@@ -453,7 +477,7 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     """
     # get database info
     processing_db.append(ver_id)
-    async with aiosqlite.connect(config['db_file']) as db:
+    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
         cur = await db.cursor()
         await cur.execute("SELECT * FROM dirent WHERE id=?", (dent_id,))
         dent_row = await cur.fetchone()
@@ -472,15 +496,15 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     processing_s3.append(ver_id)
     fpath = os.path.join(restore_to, ver_row[2])
     if kind == Kind.FILE:
-        logging.info(f"fpath: {fpath}")
+        # logging.info(f"fpath: {fpath}")
         remaining_size = ver_row[3]  # file size
         async with aiofiles.open(fpath, mode='wb') as f:
             # download file contents
             async with aioboto3.client(
                     's3', endpoint_url=config['s3_endpoint'],
                     verify=False) as s3:
-                logging.info(
-                    f"S3 loading bucket {config['s3_bucket']} to {fpath}")
+                # logging.info(
+                #    f"S3 loading bucket {config['s3_bucket']} to {fpath}")
                 bufsize = remaining_size
                 if remaining_size > config['chunksize']:
                     bufsize = config['chunksize']
@@ -493,7 +517,7 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                 large_buffer = bytearray(bufsize)
                 view = memoryview(large_buffer)
                 for verobj in verobjs:
-                    logging.info(f"verobj: {verobj[1]}")
+                    # logging.info(f"verobj: {verobj[1]}")
                     fi = io.BytesIO(view)
                     await s3.download_fileobj(
                         config['s3_bucket'], verobj[1], fi)
@@ -509,13 +533,13 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                     config['large_buffers'] -= 1
         processing_s3.remove(ver_id)
     elif kind == Kind.DIRECTORY:
-        logging.info(f"mkdir {fpath}")
+        # logging.info(f"mkdir {fpath}")
         try:
             await aiofiles.os.mkdir(fpath, ver_row[7])
         except FileExistsError:
             pass
     else:  # Kind.SYMLINK
-        logging.info(f"Creating symlink: {fpath} to {ver_row[10]}")
+        # logging.info(f"Creating symlink: {fpath} to {ver_row[10]}")
         try:
             os.symlink(ver_row[10], fpath)
         except OSError as e:
@@ -539,15 +563,21 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                 or len(processing_s3) > config['s3_max']:
             await asyncio.sleep(1)
 
-        logging.info(f"Will dispatch children: {children_rows}")
+        # logging.info(f"Will dispatch children: {children_rows}")
         for child_row in children_rows:
             if child_row[5] == 1:  # is_delmarker
                 continue
+            while config['num_tasks'] >= config['restore_max']:
+                await asyncio.sleep(1)
             logging.info(f"Dispatching child: {child_row[2]}")
+            config['num_tasks'] += 1
             task = asyncio.create_task(restore_obj(
                 fpath, child_row[0],
                 child_row[1], child_row[3], Kind[child_row[4]]))
             task_list.append(task)
+
+    config['num_tasks'] -= 1
+    config['processed_files'] += 1
 
 
 async def async_restore():
@@ -567,7 +597,7 @@ async def async_restore():
 
     logging.info(f"restore-to: {config['restore_to']}")
 
-    async with aiosqlite.connect(config['db_file']) as db:
+    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
         cur = await db.cursor()
         restore_target = config['restore_target']
 
@@ -580,7 +610,8 @@ async def async_restore():
         if config['restore_target'] == 'all':
             restore_target = ''
 
-        logging.info(f"restore-target: {restore_target}")
+        logging.info(
+            f"restore-target: {config['restore_target']} ({restore_target})")
 
         # traverse path
         plist = restore_target.split('/')
@@ -608,12 +639,14 @@ async def async_restore():
         task_list.append(task)
         await asyncio.sleep(1)
         await asyncio.gather(*task_list)
+        await asyncio.sleep(5)
 
 
 def main():
     """
     Parse command line, read config file and start event loop
     """
+    config['start_time'] = datetime.datetime.now()
     parser = argparse.ArgumentParser(
         description='Backup to S3 storage')
     group = parser.add_mutually_exclusive_group()
@@ -671,7 +704,7 @@ def main():
         loop.add_signal_handler(
             s, lambda s=s: asyncio.create_task(shutdown(s, loop)))
 
-    logging.info(f"runmode: {config['runmode']}")
+    logging.info(f"runmode: {config['runmode'].name}")
     try:
         if config['runmode'] == RunMode.LIST_HISTORY:
             task = loop.create_task(async_list())
@@ -687,6 +720,9 @@ def main():
     finally:
         loop.close()
         logging.info("Completed or gracefully terminated")
+    config['end_time'] = datetime.datetime.now()
+    print(
+        f"Processed {config['processed_files']} files ({config['processed_files']/((config['end_time']-config['start_time']).total_seconds()-5)} files/sec)")
 
 
 if __name__ == "__main__":
