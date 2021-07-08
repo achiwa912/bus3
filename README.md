@@ -1,29 +1,29 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#org22e4bfd)
-    1.  [Overview](#orgfeb78d1)
-    2.  [Getting started](#org05b1490)
-        1.  [Prerequisites](#org705ef9a)
-        2.  [Installation](#org095f1d3)
-        3.  [Configuration file](#orga770315)
-        4.  [Usage](#orgb99c2d1)
-2.  [License](#org73d1027)
-3.  [Contact](#orgb84994b)
-4.  [Acknowledgements](#org581f48a)
+1.  [bus3 - buckup to S3](#org9972aa7)
+    1.  [Overview](#org3d922a5)
+    2.  [Getting started](#org21cc9d3)
+        1.  [Prerequisites](#orgc3b530a)
+        2.  [Installation](#org70f1fec)
+        3.  [Configuration file](#orge90f653)
+        4.  [Usage](#org731dd2d)
+2.  [License](#orgaccb2b8)
+3.  [Contact](#org0c6ac5b)
+4.  [Acknowledgements](#orgc34ab05)
 
 
 
-<a id="org22e4bfd"></a>
+<a id="org9972aa7"></a>
 
 # bus3 - buckup to S3
 
-`bus3.py` is a backup tool to S3 storage.  It fully utilizes `asyncio` to maximize concurrency.  It relies on `aiofiles`, `aiosqlite` and `aioboto3` libraries.
+`bus3.py` is a backup tool to S3 storage.  It fully utilizes `asyncio` to maximize concurrency.  It relies on `aiofiles`, `asyncpg` and `aioboto3` libraries.
 
-\*Important notice - bus3 is still under development (experimental) and may or may not work for now.  
+**Important notice** - bus3 is still under development (experimental) and may or may not work for now.  
 
 
-<a id="orgfeb78d1"></a>
+<a id="org3d922a5"></a>
 
 ## Overview
 
@@ -42,12 +42,12 @@ bus3 is designed so that it is supposed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in database.  The database is also backed up to S3 storage.
 
 
-<a id="org05b1490"></a>
+<a id="org21cc9d3"></a>
 
 ## Getting started
 
 
-<a id="org705ef9a"></a>
+<a id="orgc3b530a"></a>
 
 ### Prerequisites
 
@@ -61,22 +61,37 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 -   Maybe need root priviledge to execute
 
 
-<a id="org095f1d3"></a>
+<a id="org70f1fec"></a>
 
 ### Installation
 
 1.  Prepare S3 storage and a dedicated bucket for bus3.py
 2.  Setup python 3.8 or later
-3.  Install aiofiles
-4.  Install aioboto3=8.3.0 (latest 9.0 doesn't work???)
-5.  Install aiosqlite
-6.  Install pyyaml
-7.  Edit bus3.yaml for S3 storage endpoint, bucket name and directory to backup
-8.  Setup `~/.aws/credentials` (eg, aws cli)
-9.  Run `python bus3.py -b` to backup
+3.  Setup Postgres and create a database named `bus3`
+4.  Install aiofiles
+5.  Install aioboto3=8.3.0 (latest 9.0 doesn't work???)
+6.  Install asyncpg
+7.  Install pyyaml
+8.  Edit bus3.yaml for S3 storage endpoint, bucket name and directory to backup
+9.  Setup `~/.aws/credentials` (eg, aws cli)
+10. Run `python bus3.py -b` to backup
+
+1.  FYI; Postgres config for Fedora
+
+    <https://fedoraproject.org/wiki/PostgreSQL#Installation>
+    
+    1.  sudo dnf install postgresql-server
+    2.  sudo vi /var/lib/pgsql/data/pg\_hba.conf
+    
+        host    all             all             127.0.0.1/32            md5
+    
+    1.  sudo postgresql-setup &#x2013;initdb
+    2.  sudo systemctl start postgresql
+    3.  sudo su - postgres
+    4.  createdb bus3
 
 
-<a id="orga770315"></a>
+<a id="orge90f653"></a>
 
 ### Configuration file
 
@@ -88,7 +103,7 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="orgb99c2d1"></a>
+<a id="org731dd2d"></a>
 
 ### Usage
 
@@ -133,14 +148,14 @@ Note:
 If bus3.py doesn't find the database file (bus3.db) in the current directory when it performs a backup (`-b`), it will create a new one.
 
 
-<a id="org73d1027"></a>
+<a id="orgaccb2b8"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="orgb84994b"></a>
+<a id="org0c6ac5b"></a>
 
 # Contact
 
@@ -149,7 +164,7 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="org581f48a"></a>
+<a id="orgc34ab05"></a>
 
 # Acknowledgements
 
