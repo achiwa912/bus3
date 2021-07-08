@@ -14,21 +14,22 @@ import argparse
 from enum import Enum
 from pathlib import Path
 
-import aiosqlite
 import aiofiles
 import aiofiles.os
 import aioboto3
+import asyncpg
 
 config = {
-    'db_file': 'bus3.db',
+    'db_endpoint': 'postgresql://postgres@127.0.0.1/bus3',
     # 'chunksize': 64*1024*1024,  # max object chunk size in S3 (64MB)
     'chunksize': 4*1024*1024,  # max object chunk size in S3 (4MB; for testing)
     'buffersize': 256*1024,  # buffer size for hash calculation (256KB)
-    's3_max': 100,  # max number of S3 tasks
-    'db_max': 64,  # max number of db tasks
+    's3_max': 150,  # max number of S3 tasks
+    'db_max': 96,  # max number of db tasks
     'lb_max': 16,  # max number of tasks using large buffers
-    'restore_max': 96,  # max concurrent restore tasks
-    'sqlite_timeout': 180,  # timeout value
+    'restore_max': 256,  # max concurrent restore tasks
+    'db_timeout': 180,  # timeout value
+    'db_password': 'bus3pass',
     # global temp variables from here:
     'scan_counter': 1,  # initial value
     'root_dir': None,  # backup root directory (will be overwritten)
@@ -42,6 +43,7 @@ config = {
     'processed_files': 0,  # number of processed files
     'start_time': 0,
     'end_time': 0,
+    'db_pool': None,  # database connection pool
 }
 processing_db = []  # list of paths to files/dirs
 processing_s3 = []  # list of paths to files
@@ -70,24 +72,21 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         version_row_id: version id if created.  -1 if not
         contents_changed: True if file contents changed
     """
-    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
-        cur = await db.cursor()
+    async with config['db_pool'].acquire() as db:
 
         # dirent table
-        await cur.execute(
-            "SELECT * FROM dirent WHERE fsid=? AND inode=?",
-            (fsid, stat.st_ino))
-        dirent_row = await cur.fetchone()
+        dirent_row = await db.fetchrow(
+            "SELECT * FROM dirent WHERE fsid=$1 AND inode=$2",
+            fsid, stat.st_ino)
         if not dirent_row:
-            await cur.execute(
-                "INSERT INTO dirent (id, is_deleted, type, fsid, inode, scan_counter) VALUES (?, 0, ?, ?, ?, ?)",
-                (None, kind.name, fsid, stat.st_ino, config['scan_counter']))
-            dirent_row_id = cur.lastrowid
+            dirent_row_id = await db.fetchval(
+                "INSERT INTO dirent (is_deleted, type, fsid, inode, scan_counter) VALUES (0, $1, $2, $3, $4) RETURNING id",
+                kind.name, fsid, stat.st_ino, config['scan_counter'])
         else:
             dirent_row_id = dirent_row[0]
-            await cur.execute(
-                "UPDATE dirent SET is_deleted = 0, scan_counter = ? WHERE id = ?",
-                (config['scan_counter'], dirent_row_id))
+            await db.execute(
+                "UPDATE dirent SET is_deleted = 0, scan_counter = $1 WHERE id = $2",
+                config['scan_counter'], dirent_row_id)
 
         # version table
         version_row_id = -1
@@ -95,41 +94,41 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         link_path = ""
         if kind == Kind.SYMLINK:
             link_path = os.readlink(path)
-        await cur.execute(
-            "SELECT * FROM version WHERE dirent_id=? ORDER BY id DESC",
-            (dirent_row_id, ))
-        version_row = await cur.fetchone()
+        version_row = await db.fetchrow(
+            "SELECT * FROM version WHERE dirent_id=$1 ORDER BY id DESC",
+            dirent_row_id)
         if not version_row:
             xattrdic = {}
             names = os.listxattr(path, follow_symlinks=False)
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
-            await cur.execute(
-                "INSERT INTO version (id, is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (None, os.path.basename(path), stat.st_size,
-                 stat.st_ctime, stat.st_mtime, stat.st_atime,
-                 stat.st_mode, stat.st_uid, stat.st_gid, link_path,
-                 str(xattrdic), dirent_row_id,
-                 config['scan_counter'], parent))
-            version_row_id = cur.lastrowid
+            version_row_id = await db.fetchval(
+                "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+                os.path.basename(path), stat.st_size,
+                datetime.datetime.fromtimestamp(stat.st_ctime),
+                datetime.datetime.fromtimestamp(stat.st_mtime),
+                datetime.datetime.fromtimestamp(stat.st_atime),
+                stat.st_mode, stat.st_uid, stat.st_gid, link_path,
+                str(xattrdic), dirent_row_id,
+                config['scan_counter'], parent)
             contents_changed = True
-        elif version_row[4] != stat.st_ctime \
-                or version_row[5] != stat.st_mtime:
+        elif version_row[4] != datetime.datetime.fromtimestamp(stat.st_ctime) \
+                or version_row[5] != datetime.datetime.fromtimestamp(stat.st_mtime):
             xattrdic = {}
             names = os.listxattr(path, follow_symlinks=False)
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
-            await cur.execute(
-                "INSERT INTO version (id, is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (None, os.path.basename(path), stat.st_size,
-                 stat.st_ctime, stat.st_mtime, stat.st_atime,
-                 stat.st_mode, stat.st_uid, stat.st_gid, link_path,
-                 str(xattrdic), dirent_row_id,
-                 config['scan_counter'], parent))
-            version_row_id = cur.lastrowid
+            version_row_id = await db.fetchval(
+                "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+                os.path.basename(path), stat.st_size,
+                datetime.datetime.fromtimestamp(stat.st_ctime),
+                datetime.datetime.fromtimestamp(stat.st_mtime),
+                datetime.datetime.fromtimestamp(stat.st_atime),
+                stat.st_mode, stat.st_uid, stat.st_gid, link_path,
+                str(xattrdic), dirent_row_id,
+                config['scan_counter'], parent)
             if version_row[5] != stat.st_mtime:  # contents changed?
                 contents_changed = True
-        await db.commit()
     return dirent_row_id, version_row_id, contents_changed
 
 
@@ -148,9 +147,12 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
     async with aioboto3.client(
             's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
         if size <= config['buffersize']:
-            fo = io.BytesIO(contents)
+            view = memoryview(contents)
+            fo = io.BytesIO(view)
             await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
             processing_s3.remove(file_path)
+            del view
+            del contents
             return
 
         while config['large_buffers'] >= config['lb_max']:
@@ -217,16 +219,12 @@ async def process_file(path, parent, fsid, islink):
                 hash_val.update(contents)
                 prev_contents = contents
             object_hash = hash_val.hexdigest()
-            async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
-                cur = await db.cursor()
-                await cur.execute("SELECT * FROM ver_object WHERE object_hash=?",
-                                  (object_hash,))
+            async with config['db_pool'].acquire() as db:
+                ver_object_row = await db.fetchrow("SELECT * FROM ver_object WHERE object_hash=$1", object_hash)
                 # find an ver_object_row -> same content object is in S3
-                ver_object_row = await cur.fetchone()
-                await cur.execute(
-                    "INSERT INTO ver_object (ver_id, object_hash) VALUES (?, ?)",
-                    (version_row_id, object_hash))
-                await db.commit()
+                await db.execute(
+                    "INSERT INTO ver_object (ver_id, object_hash) VALUES ($1, $2)",
+                    version_row_id, object_hash)
             if not ver_object_row and size != 0:
                 task = asyncio.create_task(
                     write_to_s3(chunk_index, path, object_hash, size, prev_contents))
@@ -313,11 +311,21 @@ async def check_db():
     Check if database file exists
     Return True/False
     """
-    db_file = Path(config['db_file'])
-    if not db_file.is_file:
-        logging.error(f"{config['db_file']} doesn't exist.  Aborting.")
-        return False
-    return True
+    db = None
+    try:
+        db = await asyncpg.connect(
+            config['db_endpoint'], password=config['db_password'],
+            command_timeout=config['db_timeout'])
+        val = await db.fetchval(
+            "SELECT datname FROM pg_catalog.pg_database WHERE datname = 'bus3'")
+        if val:
+            db.close()
+            return True
+    except:
+        pass
+    if db:
+        db.close()
+    return False
 
 
 async def async_backup():
@@ -330,19 +338,24 @@ async def async_backup():
     if not healthy:
         return
 
-    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
-        cur = await db.cursor()
-        await cur.execute("""CREATE TABLE IF NOT EXISTS dirent (
-            id integer PRIMARY KEY,
+    # create database connection pool
+    config['db_pool'] = await asyncpg.create_pool(
+        config['db_endpoint'], password=config['db_password'],
+        command_timeout=config['db_timeout'])
+
+    async with config['db_pool'].acquire() as db:
+        async with db.transaction():
+            await db.execute("""CREATE TABLE IF NOT EXISTS dirent (
+            id SERIAL PRIMARY KEY,
             is_deleted integer NOT NULL,
             type text NOT NULL,
             fsid text NOT NULL,
             inode integer NOT NULL,
-            scan_counter integer NOT NULL
+            scan_counter bigint NOT NULL
             );""")
-        await cur.execute("CREATE INDEX Dentidx1 ON dirent(fsid, inode);")
-        await cur.execute("""CREATE TABLE IF NOT EXISTS version (
-            id integer PRIMARY KEY,
+            await db.execute("CREATE INDEX IF NOT EXISTS Dentidx1 ON dirent(fsid, inode);")
+            await db.execute("""CREATE TABLE IF NOT EXISTS version (
+            id SERIAL PRIMARY KEY,
             is_delmarker integer NOT NULL,
             name text NOT NULL,
             size integer NOT NULL,
@@ -355,65 +368,57 @@ async def async_backup():
             link_path text,
             xattr text,
             dirent_id integer NOT NULL,
-            scan_counter integer NOT NULL,
+            scan_counter bigint NOT NULL,
             parent_id integer NOT NULL,
             FOREIGN KEY (dirent_id) REFERENCES dirent (id)
             );""")
-        await cur.execute("CREATE INDEX Veridx1 ON version(dirent_id);")
-        await cur.execute("""CREATE TABLE IF NOT EXISTS ver_object (
+            await db.execute("CREATE INDEX IF NOT EXISTS Veridx1 ON version(dirent_id);")
+            await db.execute("""CREATE TABLE IF NOT EXISTS ver_object (
             ver_id integer NOT NULL,
             object_hash text NOT NULL,
             FOREIGN KEY (ver_id) REFERENCES version (id)
             );""")
-        await cur.execute("CREATE INDEX Voidx1 ON ver_object(ver_id);")
-        await cur.execute("CREATE INDEX Voidx2 ON ver_object(object_hash);")
-        await cur.execute("""CREATE TABLE IF NOT EXISTS scan (
-            scan_counter integer PRIMARY KEY,
+            await db.execute("CREATE INDEX IF NOT EXISTS Voidx1 ON ver_object(ver_id);")
+            await db.execute("CREATE INDEX IF NOT EXISTS Voidx2 ON ver_object(object_hash);")
+            await db.execute("""CREATE TABLE IF NOT EXISTS scan (
+            scan_counter bigint PRIMARY KEY,
             start_time timestamp NOT NULL,
             root_dir text NOT NULL
             );""")
-        await cur.execute("SELECT MAX(scan_counter) FROM dirent;")
-        row = await cur.fetchone()
-        if row[0] or row[0] == 0:
-            config['scan_counter'] = row[0] + 1
-        logging.info(f"scan_counter: {config['scan_counter']}")
-        await cur.execute(
-            "INSERT INTO scan (scan_counter, start_time, root_dir) VALUES (?, ?, ?)",
-            (config['scan_counter'], datetime.datetime.now(), config['root_dir']))
-        await db.commit()
+            maxsc = await db.fetchval("SELECT MAX(scan_counter) FROM dirent;")
+            if maxsc or maxsc == 0:
+                config['scan_counter'] = maxsc + 1
+            logging.info(f"scan_counter: {config['scan_counter']}")
+            await db.execute("INSERT INTO scan (scan_counter, start_time, root_dir) VALUES ($1, $2, $3)", config['scan_counter'], datetime.datetime.now(), config['root_dir'])
     task = asyncio.create_task(process_dir(config['root_dir'], -1))
     task_list.append(task)
     await asyncio.sleep(1)  # wait a while for task_list to be populated
     await asyncio.gather(*task_list)
 
     # Take care of deleted files and directories
-    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
-        cur = await db.cursor()
+    async with config['db_pool'].acquire() as db:
 
         # mark dirent as deleted
-        await cur.execute("SELECT id FROM dirent WHERE is_deleted = 0 AND scan_counter < ?", (config['scan_counter'],))
-        dent_rows = await cur.fetchall()
+        dent_rows = await db.fetch("SELECT id FROM dirent WHERE is_deleted = 0 AND scan_counter < $1", config['scan_counter'])
         for dent_row in dent_rows:
             logging.info(f"{dent_row}")
-            await cur.execute("UPDATE dirent SET is_deleted = 1 WHERE id = ?", (dent_row[0],))
+            await db.execute("UPDATE dirent SET is_deleted = 1 WHERE id = $1", dent_row[0])
 
             # Insert delete marker version
-            await cur.execute("SELECT * FROM version WHERE dirent_id=? ORDER BY id DESC", (dent_row[0],))
-            r = await cur.fetchone()
+            r = await db.fetchrow("SELECT * FROM version WHERE dirent_id=$1 ORDER BY id DESC", dent_row[0])
             if r[1] != 1:  # is_delmarker
                 logging.info(f"delete row - {r}")
-                await cur.execute("INSERT INTO version (id, is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, dirent_id, scan_counter, parent_id) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (None, r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[12], config['scan_counter'], r[14]))
+                await db.execute("INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, dirent_id, scan_counter, parent_id) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)", r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[12], config['scan_counter'], r[14])
 
-        await db.commit()
-
+    """
     # backup db file to S3
     async with aioboto3.client(
             's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
         obj_name = '_'.join(
-            [config['db_file'], str(config['scan_counter'])])
+            [config['db_endpoint'], str(config['scan_counter'])])
         await s3.upload_file(
-            config['db_file'], config['s3_bucket'], obj_name)
-
+            config['db_endpoint'], config['s3_bucket'], obj_name)
+    """
     await asyncio.sleep(5)
 
 
@@ -424,10 +429,9 @@ async def async_list():
     healthy = await check_db()
     if not healthy:
         return
-    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
-        cur = await db.cursor()
-        await cur.execute("SELECT * FROM scan")
-        rows = await cur.fetchall()
+    async with config['db_pool'].acquire() as db:
+        db = await db.cursor()
+        rows = await cur.fetch("SELECT * FROM scan")
         print(f"  #: {'date & time'.ljust(19)} backup root directory")
         for row in rows:
             print(f"{row[0]:3d}: {row[1][:19]} {row[2]}")
@@ -447,16 +451,16 @@ async def async_restoredb():
             's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
         bucket = await s3.Bucket(config['s3_bucket'])
         dbbkup_objs = bucket.objects.filter(
-            Prefix=config['db_file'])
+            Prefix=config['db_endpoint'])
         sorted_dbbkups = []
         async for name in dbbkup_objs:
             logging.info(f"name: {str(name)}")
             name = name.key
-            sorted_dbbkups.append(name[len(config['db_file'])+1:])
+            sorted_dbbkups.append(name[len(config['db_endpoint'])+1:])
     sorted_dbbkups.sort()
     logging.info(f"sorted_dbbkups - {sorted_dbbkups}")
     try:
-        file_name = '_'.join([config['db_file'],
+        file_name = '_'.join([config['db_endpoint'],
                               sorted_dbbkups[config['dbrestore_rel']-1]])
     except:
         logging.error(f"No such database backup file version.")
@@ -465,7 +469,7 @@ async def async_restoredb():
             's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
         try:
             await s3.download_file(
-                config['s3_bucket'], file_name, config['db_file'])
+                config['s3_bucket'], file_name, config['db_endpoint'])
             logging.info(f"restored databae: {file_name}")
         except:
             logging.error(f"Can't download {file_name}")
@@ -477,19 +481,16 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     """
     # get database info
     processing_db.append(ver_id)
-    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
-        cur = await db.cursor()
-        await cur.execute("SELECT * FROM dirent WHERE id=?", (dent_id,))
-        dent_row = await cur.fetchone()
-        await cur.execute("SELECT * FROM version WHERE id=?", (ver_id,))
-        ver_row = await cur.fetchone()
-        await cur.execute("SELECT * FROM ver_object WHERE ver_id=?",
-                          (ver_id,))
-        verobjs = await cur.fetchall()
+    async with config['db_pool'].acquire() as db:
+        dent_row = await db.fetchrow(
+            "SELECT * FROM dirent WHERE id=$1", dent_id)
+        ver_row = await db.fetchrow(
+            "SELECT * FROM version WHERE id=$1", ver_id)
+        verobjs = await db.fetch(
+            "SELECT * FROM ver_object WHERE ver_id=$1", ver_id)
         if kind == Kind.DIRECTORY:
             # Get children to dispatch
-            await cur.execute("SELECT d.id, v.id, v.name, v.parent_id, d.type, v.is_delmarker, MAX(v.scan_counter) FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE (SELECT dirent_id FROM version WHERE id = v.parent_id) = ? AND v.scan_counter <= ? GROUP BY v.name ORDER BY v.scan_counter DESC", (dent_id, config['restore_version']))
-            children_rows = await cur.fetchall()
+            children_rows = await db.fetch("SELECT d.id, v.id, v.name, v.parent_id, d.type, v.is_delmarker, MAX(v.scan_counter) FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE (SELECT dirent_id FROM version WHERE id = v.parent_id) = $1 AND v.scan_counter <= $2 GROUP BY v.name, d.id, v.id ORDER BY v.scan_counter DESC", dent_id, config['restore_version'])
     processing_db.remove(ver_id)
 
     # download file contents
@@ -552,7 +553,9 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
         # This will cause an exception for a symlink
         os.chmod(fpath, ver_row[7], follow_symlinks=False)
     os.chown(fpath, ver_row[8], ver_row[9], follow_symlinks=False)
-    os.utime(fpath, (ver_row[5], ver_row[6]), follow_symlinks=False)
+    os.utime(fpath, (datetime.datetime.timestamp(ver_row[5]),
+                     datetime.datetime.timestamp(ver_row[6])),
+             follow_symlinks=False)
     xattr_dict = eval(ver_row[11])
     for k, v in xattr_dict.items():
         os.setxattr(fpath, k, v, follow_symlinks=False)
@@ -584,11 +587,20 @@ async def async_restore():
     """
     async task to restore files and directories
     """
+    logging.info(f"starting 0")
     healthy_db = await check_db()
+    logging.info(f"starting 1")
     healthy_s3 = await check_s3()
     if not healthy_db or not healthy_s3:
+        logging.info(f"starting 2 {healthy_db} {healthy_s3}")
         return
 
+    # create database connection pool
+    config['db_pool'] = await asyncpg.create_pool(
+        config['db_endpoint'], password=config['db_password'],
+        command_timeout=config['db_timeout'])
+
+    logging.info(f"starting 3")
     # Check restore-to directory
     if not os.path.isdir(config['restore_to']):
         logging.error(
@@ -597,14 +609,12 @@ async def async_restore():
 
     logging.info(f"restore-to: {config['restore_to']}")
 
-    async with aiosqlite.connect(config['db_file'], timeout=config['sqlite_timeout']) as db:
-        cur = await db.cursor()
+    async with config['db_pool'].acquire() as db:
         restore_target = config['restore_target']
 
         # convert restore_target to relative from root_dir
-        await cur.execute(
+        row = await db.fetchrow(
             "SELECT root_dir FROM scan ORDER BY scan_counter DESC;")
-        row = await cur.fetchone()
         if config['restore_target'].startswith(row[0]):
             restore_target = restore_target.replace(row[0], '')
         if config['restore_target'] == 'all':
@@ -616,14 +626,12 @@ async def async_restore():
         # traverse path
         plist = restore_target.split('/')
         parent_id = -1  # root_dir
-        await cur.execute(
-            "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
-        row = await cur.fetchone()
+        row = await db.fetchrow(
+            "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=$1 AND v.scan_counter<=$2 ORDER BY v.scan_counter DESC;", parent_id, config['restore_version'])
         for pitem in plist[:-1]:
             parent_id = row[0]
-            await cur.execute(
-                "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=? AND v.scan_counter<=? ORDER BY v.scan_counter DESC;", (parent_id, config['restore_version']))
-            row = await cur.fetchone()
+            row = await db.fetchrow(
+                "SELECT d.id, v.id, d.type FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE v.parent_id=$1 AND v.scan_counter<=$2 ORDER BY v.scan_counter DESC;", parent_id, config['restore_version'])
             logging.info(f"row tup - {row}")
             if not row:
                 logging.error(
