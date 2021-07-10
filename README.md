@@ -1,20 +1,21 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#org9972aa7)
-    1.  [Overview](#org3d922a5)
-    2.  [Getting started](#org21cc9d3)
-        1.  [Prerequisites](#orgc3b530a)
-        2.  [Installation](#org70f1fec)
-        3.  [Configuration file](#orge90f653)
-        4.  [Usage](#org731dd2d)
-2.  [License](#orgaccb2b8)
-3.  [Contact](#org0c6ac5b)
-4.  [Acknowledgements](#orgc34ab05)
+1.  [bus3 - buckup to S3](#org0937ef8)
+    1.  [Overview](#org9276a90)
+    2.  [Getting started](#org7a33ce6)
+        1.  [Prerequisites](#org563c3c8)
+        2.  [Installation](#org6f5fa12)
+        3.  [FYI; Postgres config for Fedora/CentOS](#org29bb405)
+        4.  [Configuration file](#orge63d634)
+        5.  [Usage](#org4fc1b98)
+2.  [License](#org7eed7df)
+3.  [Contact](#org6b7c4f2)
+4.  [Acknowledgements](#org7e3cf75)
 
 
 
-<a id="org9972aa7"></a>
+<a id="org0937ef8"></a>
 
 # bus3 - buckup to S3
 
@@ -23,7 +24,7 @@
 **Important notice** - bus3 is still under development (experimental) and may or may not work for now.  
 
 
-<a id="org3d922a5"></a>
+<a id="org9276a90"></a>
 
 ## Overview
 
@@ -42,26 +43,26 @@ bus3 is designed so that it is supposed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in database.  The database is also backed up to S3 storage.
 
 
-<a id="org21cc9d3"></a>
+<a id="org7a33ce6"></a>
 
 ## Getting started
 
 
-<a id="orgc3b530a"></a>
+<a id="org563c3c8"></a>
 
 ### Prerequisites
 
 -   S3 storage
     -   **Not tested with Amazon AWS S3 (yet)**
 -   Linux
-    -   Developed on Fedora 33
+    -   Developed on Fedora 33 and CentOS 8
 -   Python 3.8 or later
 -   bus3.py - the backup tool
 -   bus3.yaml - config file
 -   Maybe need root priviledge to execute
 
 
-<a id="org70f1fec"></a>
+<a id="org6f5fa12"></a>
 
 ### Installation
 
@@ -76,22 +77,28 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 9.  Setup `~/.aws/credentials` (eg, aws cli)
 10. Run `python bus3.py -b` to backup
 
-1.  FYI; Postgres config for Fedora
 
-    <https://fedoraproject.org/wiki/PostgreSQL#Installation>
-    
-    1.  sudo dnf install postgresql-server
-    2.  sudo vi /var/lib/pgsql/data/pg\_hba.conf
-    
-        host    all             all             127.0.0.1/32            md5
-    
-    1.  sudo postgresql-setup &#x2013;initdb
-    2.  sudo systemctl start postgresql
-    3.  sudo su - postgres
-    4.  createdb bus3
+<a id="org29bb405"></a>
+
+### FYI; Postgres config for Fedora/CentOS
+
+<https://fedoraproject.org/wiki/PostgreSQL#Installation>
+
+1.  sudo dnf install postgresql-server
+2.  sudo vi /var/lib/pgsql/data/pg\_hba.conf
+
+    host    all             all             127.0.0.1/32            md5
+
+1.  sudo postgresql-setup &#x2013;initdb
+2.  sudo systemctl start postgresql
+3.  sudo su - postgres
+4.  createdb bus3
+5.  psql
+
+    ALTER USER postgres PASSWORD '<db-password>';
 
 
-<a id="orge90f653"></a>
+<a id="orge63d634"></a>
 
 ### Configuration file
 
@@ -103,7 +110,7 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="org731dd2d"></a>
+<a id="org4fc1b98"></a>
 
 ### Usage
 
@@ -148,14 +155,14 @@ Note:
 If bus3.py doesn't find the database file (bus3.db) in the current directory when it performs a backup (`-b`), it will create a new one.
 
 
-<a id="orgaccb2b8"></a>
+<a id="org7eed7df"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="org0c6ac5b"></a>
+<a id="org6b7c4f2"></a>
 
 # Contact
 
@@ -164,7 +171,7 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="orgc34ab05"></a>
+<a id="org7e3cf75"></a>
 
 # Acknowledgements
 

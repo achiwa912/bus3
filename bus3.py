@@ -551,7 +551,7 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
     # set file/directory attributes
     if kind != Kind.SYMLINK:
         # This will cause an exception for a symlink
-        os.chmod(fpath, ver_row[7], follow_symlinks=False)
+        os.chmod(fpath, ver_row[7])
     os.chown(fpath, ver_row[8], ver_row[9], follow_symlinks=False)
     os.utime(fpath, (datetime.datetime.timestamp(ver_row[5]),
                      datetime.datetime.timestamp(ver_row[6])),
