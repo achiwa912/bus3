@@ -429,12 +429,17 @@ async def async_list():
     healthy = await check_db()
     if not healthy:
         return
+
+    # create database connection pool
+    config['db_pool'] = await asyncpg.create_pool(
+        config['db_endpoint'], password=config['db_password'],
+        command_timeout=config['db_timeout'])
+
     async with config['db_pool'].acquire() as db:
-        db = await db.cursor()
-        rows = await cur.fetch("SELECT * FROM scan")
+        rows = await db.fetch("SELECT * FROM scan")
         print(f"  #: {'date & time'.ljust(19)} backup root directory")
         for row in rows:
-            print(f"{row[0]:3d}: {row[1][:19]} {row[2]}")
+            print(f"{row[0]:3d}: {str(row[1])[:19]} {row[2]}")
 
 
 async def async_restoredb():
