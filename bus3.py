@@ -4,16 +4,15 @@ import sys
 import io
 import asyncio
 import logging
-import random
 import signal
 import hashlib
-import uuid
 import datetime
-import yaml
 import argparse
 from enum import Enum
 from pathlib import Path
+import contextlib
 
+import yaml
 import aiofiles
 import aiofiles.os
 import aioboto3
@@ -30,6 +29,7 @@ config = {
     'restore_max': 256,  # max concurrent restore tasks
     'db_timeout': 180,  # timeout value
     'db_password': 'bus3pass',
+    's3_pool_size': 12,  # S3 client pool size
     # global temp variables from here:
     'scan_counter': 1,  # initial value
     'root_dir': None,  # backup root directory (will be overwritten)
@@ -44,10 +44,12 @@ config = {
     'start_time': 0,
     'end_time': 0,
     'db_pool': None,  # database connection pool
+    's3_pool': [],  # S3 client pool
 }
 processing_db = []  # list of paths to files/dirs
 processing_s3 = []  # list of paths to files
 task_list = []  # task list
+hardlink_dict = {}  # dict of hard links (fsid, inode): <path> or None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,9 +73,11 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         dirent_row_id: dirent id
         version_row_id: version id if created.  -1 if not
         contents_changed: True if file contents changed
+        is_hardlink: True if it's a hard link
     """
     async with config['db_pool'].acquire() as db:
 
+        is_hardlink = False  # hard link flag
         # dirent table
         dirent_row = await db.fetchrow(
             "SELECT * FROM dirent WHERE fsid=$1 AND inode=$2",
@@ -84,9 +88,12 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
                 kind.name, fsid, stat.st_ino, config['scan_counter'])
         else:
             dirent_row_id = dirent_row[0]
-            await db.execute(
-                "UPDATE dirent SET is_deleted = 0, scan_counter = $1 WHERE id = $2",
-                config['scan_counter'], dirent_row_id)
+            if dirent_row[5] == config['scan_counter']:
+                is_hardlink = True
+            else:
+                await db.execute(
+                    "UPDATE dirent SET is_deleted = 0, scan_counter = $1 WHERE id = $2",
+                    config['scan_counter'], dirent_row_id)
 
         # version table
         version_row_id = -1
@@ -97,20 +104,20 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         version_row = await db.fetchrow(
             "SELECT * FROM version WHERE dirent_id=$1 ORDER BY id DESC",
             dirent_row_id)
-        if not version_row:
+        if not version_row or is_hardlink:
             xattrdic = {}
             names = os.listxattr(path, follow_symlinks=False)
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
             version_row_id = await db.fetchval(
-                "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+                "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id, is_hardlink) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
                 os.path.basename(path), stat.st_size,
                 datetime.datetime.fromtimestamp(stat.st_ctime),
                 datetime.datetime.fromtimestamp(stat.st_mtime),
                 datetime.datetime.fromtimestamp(stat.st_atime),
                 stat.st_mode, stat.st_uid, stat.st_gid, link_path,
                 str(xattrdic), dirent_row_id,
-                config['scan_counter'], parent)
+                config['scan_counter'], parent, is_hardlink)
             contents_changed = True
         elif version_row[4] != datetime.datetime.fromtimestamp(stat.st_ctime) \
                 or version_row[5] != datetime.datetime.fromtimestamp(stat.st_mtime):
@@ -119,17 +126,19 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
             version_row_id = await db.fetchval(
-                "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+                "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id, is_hardlink) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
                 os.path.basename(path), stat.st_size,
                 datetime.datetime.fromtimestamp(stat.st_ctime),
                 datetime.datetime.fromtimestamp(stat.st_mtime),
                 datetime.datetime.fromtimestamp(stat.st_atime),
                 stat.st_mode, stat.st_uid, stat.st_gid, link_path,
                 str(xattrdic), dirent_row_id,
-                config['scan_counter'], parent)
+                config['scan_counter'], parent, is_hardlink)
             if version_row[5] != stat.st_mtime:  # contents changed?
                 contents_changed = True
-    return dirent_row_id, version_row_id, contents_changed
+        if is_hardlink:
+            await db.execute("UPDATE version SET is_hardlink=True WHERE dirent_id=$1", dirent_row_id)
+    return dirent_row_id, version_row_id, contents_changed, is_hardlink
 
 
 async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
@@ -144,31 +153,35 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
                   (ie, don't need to read file again)
     """
     processing_s3.append(file_path)
-    async with aioboto3.client(
-            's3', endpoint_url=config['s3_endpoint'], verify=False) as s3:
-        if size <= config['buffersize']:
-            view = memoryview(contents)
-            fo = io.BytesIO(view)
-            await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
-            processing_s3.remove(file_path)
-            del view
-            del contents
-            return
+    while not config['s3_pool']:
+        await asyncio.sleep(0.5)
+    s3 = config['s3_pool'].pop()
 
-        while config['large_buffers'] >= config['lb_max']:
-            await asyncio.sleep(1)
-        config['large_buffers'] += 1
-        logging.info(f"Grab a large buffer: {size}")
-        large_buffer = bytearray(size)
-        view = memoryview(large_buffer)
-        async with aiofiles.open(file_path, mode='rb') as f:
-            await f.seek(chunk_index * config['chunksize'])
-            await f.readinto(view)
-            fo = io.BytesIO(view)
-            await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
+    if size <= config['buffersize']:
+        view = memoryview(contents)
+        fo = io.BytesIO(view)
+        await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
+        config['s3_pool'].append(s3)  # put S3 client back to pool
+        processing_s3.remove(file_path)
         del view
-        del large_buffer
-        config['large_buffers'] -= 1
+        del contents
+        return
+
+    while config['large_buffers'] >= config['lb_max']:
+        await asyncio.sleep(1)
+    config['large_buffers'] += 1
+    logging.info(f"Grab a large buffer: {size}")
+    large_buffer = bytearray(size)
+    view = memoryview(large_buffer)
+    async with aiofiles.open(file_path, mode='rb') as f:
+        await f.seek(chunk_index * config['chunksize'])
+        await f.readinto(view)
+        fo = io.BytesIO(view)
+        await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
+    del view
+    del large_buffer
+    config['large_buffers'] -= 1
+    config['s3_pool'].append(s3)  # put S3 client back to pool
     processing_s3.remove(file_path)
     logging.info(
         f"Processed s3 write: {file_path} (db:{len(processing_db)},s3:{len(processing_s3)})")
@@ -194,9 +207,11 @@ async def process_file(path, parent, fsid, islink):
         return
 
     version_wor_id, contents_changed = 1, True
-    _, version_row_id, contents_changed = \
+    _, version_row_id, contents_changed, is_hardlink = \
         await set_dirent_version(path, parent, fsid, stat, Kind.FILE)
-    if not contents_changed:  # no update to file contents?
+    if not contents_changed or is_hardlink:  # no update to file contents?
+        if is_hardlink:
+            logging.info(f"hard link for file: {path}")
         processing_db.remove(path)
         config['num_tasks'] -= 1
         return
@@ -250,9 +265,12 @@ async def process_dir(path, parent):
     processing_db.append(path)
     fsid = str(os.statvfs(path).f_fsid)  # not async
     stat = await aiofiles.os.stat(path)
-    _, version_row_id, _ = \
+    _, version_row_id, _, is_hardlink = \
         await set_dirent_version(path, parent, fsid, stat, Kind.DIRECTORY)
     processing_db.remove(path)
+    if is_hardlink:
+        logging.info(f"hard link for dir: {path}")
+        return
 
     # create tasks for dirs and files in the directory
     for dent in os.scandir(path):
@@ -282,7 +300,7 @@ async def process_dir(path, parent):
 
 async def shutdown(signal, loop):
     """Cleanup tasks."""
-    logging.info(f"Received exit signal {signal.name}...")
+    logging.error(f"Received exit signal {signal.name}...")
     tasks = [t for t in asyncio.all_tasks() if t is not
              asyncio.current_task()]
     [task.cancel() for task in tasks]
@@ -343,6 +361,15 @@ async def async_backup():
         config['db_endpoint'], password=config['db_password'],
         command_timeout=config['db_timeout'])
 
+    # create S3 client pool
+    context_stack = contextlib.AsyncExitStack()
+    for _ in range(config['s3_pool_size']):
+        s3 = await context_stack.enter_async_context(
+            aioboto3.client(
+                's3', endpoint_url=config['s3_endpoint'],
+                verify=False))
+        config['s3_pool'].append(s3)
+
     async with config['db_pool'].acquire() as db:
         async with db.transaction():
             await db.execute("""CREATE TABLE IF NOT EXISTS dirent (
@@ -370,15 +397,17 @@ async def async_backup():
             dirent_id integer NOT NULL,
             scan_counter bigint NOT NULL,
             parent_id integer NOT NULL,
+            is_hardlink bool NOT NULL,
             FOREIGN KEY (dirent_id) REFERENCES dirent (id)
             );""")
             await db.execute("CREATE INDEX IF NOT EXISTS Veridx1 ON version(dirent_id);")
             await db.execute("""CREATE TABLE IF NOT EXISTS ver_object (
+            id SERIAL PRIMARY KEY,
             ver_id integer NOT NULL,
             object_hash text NOT NULL,
             FOREIGN KEY (ver_id) REFERENCES version (id)
             );""")
-            await db.execute("CREATE INDEX IF NOT EXISTS Voidx1 ON ver_object(ver_id);")
+            await db.execute("CREATE INDEX IF NOT EXISTS Voidx1 ON ver_object(id, ver_id);")
             await db.execute("CREATE INDEX IF NOT EXISTS Voidx2 ON ver_object(object_hash);")
             await db.execute("""CREATE TABLE IF NOT EXISTS scan (
             scan_counter bigint PRIMARY KEY,
@@ -392,6 +421,9 @@ async def async_backup():
             await db.execute("INSERT INTO scan (scan_counter, start_time, root_dir) VALUES ($1, $2, $3)", config['scan_counter'], datetime.datetime.now(), config['root_dir'])
     task = asyncio.create_task(process_dir(config['root_dir'], -1))
     task_list.append(task)
+    await asyncio.sleep(1)  # wait a while for task_list to be populated
+    while processing_db or processing_s3:
+        await asyncio.sleep(0.5)
     await asyncio.sleep(1)  # wait a while for task_list to be populated
     await asyncio.gather(*task_list)
 
@@ -408,7 +440,7 @@ async def async_backup():
             r = await db.fetchrow("SELECT * FROM version WHERE dirent_id=$1 ORDER BY id DESC", dent_row[0])
             if r[1] != 1:  # is_delmarker
                 logging.info(f"delete row - {r}")
-                await db.execute("INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, dirent_id, scan_counter, parent_id) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)", r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[12], config['scan_counter'], r[14])
+                await db.execute("INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, dirent_id, scan_counter, parent_id, is_hardlink) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)", r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[12], config['scan_counter'], r[14], r[15])
 
     """
     # backup db file to S3
@@ -419,7 +451,9 @@ async def async_backup():
         await s3.upload_file(
             config['db_endpoint'], config['s3_bucket'], obj_name)
     """
-    await asyncio.sleep(5)
+    await asyncio.sleep(2)
+    for s3 in config['s3_pool']:
+        await s3.close()
 
 
 async def async_list():
@@ -491,21 +525,30 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
             "SELECT * FROM dirent WHERE id=$1", dent_id)
         ver_row = await db.fetchrow(
             "SELECT * FROM version WHERE id=$1", ver_id)
+        is_hardlink = ver_row[15]
+        process_hardlink = False
+        fsid_inode = (dent_row[3], dent_row[4])
+        if is_hardlink:
+            logging.info(f"hlink proc: {ver_row[2]} {hardlink_dict}")
+            if fsid_inode in hardlink_dict.keys():
+                process_hardlink = True  # skip restore as it's a hard link
+            else:
+                hardlink_dict[fsid_inode] = None
         verobjs = await db.fetch(
             "SELECT * FROM ver_object WHERE ver_id=$1", ver_id)
-        if kind == Kind.DIRECTORY:
+        if kind == Kind.DIRECTORY and not is_hardlink:
             # Get children to dispatch
             children_rows = await db.fetch("SELECT d.id, v.id, v.name, v.parent_id, d.type, v.is_delmarker, MAX(v.scan_counter) FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE (SELECT dirent_id FROM version WHERE id = v.parent_id) = $1 AND v.scan_counter <= $2 GROUP BY v.name, d.id, v.id ORDER BY v.scan_counter DESC", dent_id, config['restore_version'])
     processing_db.remove(ver_id)
 
     # download file contents
-    processing_s3.append(ver_id)
     fpath = os.path.join(restore_to, ver_row[2])
-    if kind == Kind.FILE:
+    if kind == Kind.FILE and not process_hardlink:
         # logging.info(f"fpath: {fpath}")
         remaining_size = ver_row[3]  # file size
         async with aiofiles.open(fpath, mode='wb') as f:
             # download file contents
+            processing_s3.append(ver_id)
             async with aioboto3.client(
                     's3', endpoint_url=config['s3_endpoint'],
                     verify=False) as s3:
@@ -523,10 +566,10 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                 large_buffer = bytearray(bufsize)
                 view = memoryview(large_buffer)
                 for verobj in verobjs:
-                    # logging.info(f"verobj: {verobj[1]}")
+                    #logging.info(f"verobj: {verobj[2]}")
                     fi = io.BytesIO(view)
                     await s3.download_fileobj(
-                        config['s3_bucket'], verobj[1], fi)
+                        config['s3_bucket'], verobj[2], fi)
                     fi.seek(0)
                     if remaining_size <= bufsize:
                         await f.write(fi.read(remaining_size))
@@ -537,13 +580,20 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                 del large_buffer
                 if large_flag:
                     config['large_buffers'] -= 1
-        processing_s3.remove(ver_id)
-    elif kind == Kind.DIRECTORY:
+            processing_s3.remove(ver_id)
+    elif kind == Kind.DIRECTORY and not process_hardlink:
         # logging.info(f"mkdir {fpath}")
         try:
             await aiofiles.os.mkdir(fpath, ver_row[7])
         except FileExistsError:
             pass
+    elif process_hardlink:  # hard link
+        while True:
+            if hardlink_dict[fsid_inode]:
+                break
+            await asyncio.sleep(0.2)
+        #logging.info(f"hard link: {hardlink_dict[fsid_inode]}, {fpath}")
+        os.link(hardlink_dict[fsid_inode], fpath)
     else:  # Kind.SYMLINK
         # logging.info(f"Creating symlink: {fpath} to {ver_row[10]}")
         try:
@@ -553,36 +603,41 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
                 os.remove(fpath)
                 os.symlink(ver_row[10], fpath)
 
-    # set file/directory attributes
-    if kind != Kind.SYMLINK:
-        # This will cause an exception for a symlink
-        os.chmod(fpath, ver_row[7])
-    os.chown(fpath, ver_row[8], ver_row[9], follow_symlinks=False)
-    os.utime(fpath, (datetime.datetime.timestamp(ver_row[5]),
-                     datetime.datetime.timestamp(ver_row[6])),
-             follow_symlinks=False)
-    xattr_dict = eval(ver_row[11])
-    for k, v in xattr_dict.items():
-        os.setxattr(fpath, k, v, follow_symlinks=False)
+    if not process_hardlink:
+        # set file/directory attributes
+        if kind != Kind.SYMLINK:
+            # This will cause an exception for a symlink
+            os.chmod(fpath, ver_row[7])
+        os.chown(fpath, ver_row[8], ver_row[9], follow_symlinks=False)
+        os.utime(fpath, (datetime.datetime.timestamp(ver_row[5]),
+                         datetime.datetime.timestamp(ver_row[6])),
+                 follow_symlinks=False)
+        xattr_dict = eval(ver_row[11])
+        for k, v in xattr_dict.items():
+            os.setxattr(fpath, k, v, follow_symlinks=False)
 
-    # dispatch children tasks
-    if kind == Kind.DIRECTORY:
-        while len(processing_db) > config['db_max'] \
-                or len(processing_s3) > config['s3_max']:
-            await asyncio.sleep(1)
-
-        # logging.info(f"Will dispatch children: {children_rows}")
-        for child_row in children_rows:
-            if child_row[5] == 1:  # is_delmarker
-                continue
-            while config['num_tasks'] >= config['restore_max']:
+        # dispatch children tasks
+        if kind == Kind.DIRECTORY:
+            while len(processing_db) > config['db_max'] \
+                    or len(processing_s3) > config['s3_max']:
                 await asyncio.sleep(1)
-            logging.info(f"Dispatching child: {child_row[2]}")
-            config['num_tasks'] += 1
-            task = asyncio.create_task(restore_obj(
-                fpath, child_row[0],
-                child_row[1], child_row[3], Kind[child_row[4]]))
-            task_list.append(task)
+
+            # logging.info(f"Will dispatch children: {children_rows}")
+            for child_row in children_rows:
+                if child_row[5] == 1:  # is_delmarker
+                    continue
+                while config['num_tasks'] >= config['restore_max']:
+                    await asyncio.sleep(1)
+                logging.info(f"Dispatching child: {child_row[2]}")
+                config['num_tasks'] += 1
+                task = asyncio.create_task(restore_obj(
+                    fpath, child_row[0],
+                    child_row[1], child_row[3], Kind[child_row[4]]))
+                task_list.append(task)
+
+        if is_hardlink:
+            #logging.info(f"hlink dict set: {fpath}")
+            hardlink_dict[fsid_inode] = fpath
 
     config['num_tasks'] -= 1
     config['processed_files'] += 1
@@ -592,12 +647,10 @@ async def async_restore():
     """
     async task to restore files and directories
     """
-    logging.info(f"starting 0")
     healthy_db = await check_db()
-    logging.info(f"starting 1")
     healthy_s3 = await check_s3()
     if not healthy_db or not healthy_s3:
-        logging.info(f"starting 2 {healthy_db} {healthy_s3}")
+        logging.info(f"db or s3 not ready {healthy_db} {healthy_s3}")
         return
 
     # create database connection pool
@@ -605,7 +658,6 @@ async def async_restore():
         config['db_endpoint'], password=config['db_password'],
         command_timeout=config['db_timeout'])
 
-    logging.info(f"starting 3")
     # Check restore-to directory
     if not os.path.isdir(config['restore_to']):
         logging.error(
@@ -651,8 +703,12 @@ async def async_restore():
                         parent_id, kind))
         task_list.append(task)
         await asyncio.sleep(1)
+        while processing_db or processing_s3:
+            #logging.info(f"Waiting tasks: {processing_db}, {processing_s3}")
+            await asyncio.sleep(1)
+        await asyncio.sleep(3)
         await asyncio.gather(*task_list)
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
 
 
 def main():
