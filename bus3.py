@@ -20,16 +20,16 @@ import asyncpg
 
 config = {
     'db_endpoint': 'postgresql://postgres@127.0.0.1/bus3',
-    # 'chunksize': 64*1024*1024,  # max object chunk size in S3 (64MB)
-    'chunksize': 4*1024*1024,  # max object chunk size in S3 (4MB; for testing)
+    'chunksize': 64*1024*1024,  # max object chunk size in S3 (64MB)
+    # 'chunksize': 4*1024*1024,  # max object chunk size in S3 (4MB; for testing)
     'buffersize': 256*1024,  # buffer size for hash calculation (256KB)
-    's3_max': 150,  # max number of S3 tasks
-    'db_max': 96,  # max number of db tasks
+    's3_max': 256,  # max number of S3 tasks
+    'db_max': 256,  # max number of db tasks
     'lb_max': 16,  # max number of tasks using large buffers
+    's3_pool_size': 8,  # S3 client pool size
     'restore_max': 256,  # max concurrent restore tasks
     'db_timeout': 180,  # timeout value
     'db_password': 'bus3pass',
-    's3_pool_size': 12,  # S3 client pool size
     # global temp variables from here:
     'scan_counter': 1,  # initial value
     'root_dir': None,  # backup root directory (will be overwritten)
@@ -79,6 +79,7 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
 
         is_hardlink = False  # hard link flag
         # dirent table
+        logging.info(f"dirent for path: {path}")
         dirent_row = await db.fetchrow(
             "SELECT * FROM dirent WHERE fsid=$1 AND inode=$2",
             fsid, stat.st_ino)
@@ -101,6 +102,7 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         link_path = ""
         if kind == Kind.SYMLINK:
             link_path = os.readlink(path)
+        logging.info(f"version for path: {path}")
         version_row = await db.fetchrow(
             "SELECT * FROM version WHERE dirent_id=$1 ORDER BY id DESC",
             dirent_row_id)
@@ -109,6 +111,7 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
             names = os.listxattr(path, follow_symlinks=False)
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
+            logging.info(f"Inserting ver_row for dirent - {dirent_row_id}")
             version_row_id = await db.fetchval(
                 "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id, is_hardlink) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
                 os.path.basename(path), stat.st_size,
@@ -165,6 +168,7 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
         processing_s3.remove(file_path)
         del view
         del contents
+        config['num_tasks'] -= 1
         return
 
     while config['large_buffers'] >= config['lb_max']:
@@ -185,7 +189,7 @@ async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
     processing_s3.remove(file_path)
     logging.info(
         f"Processed s3 write: {file_path} (db:{len(processing_db)},s3:{len(processing_s3)})")
-
+    config['num_tasks'] -= 1
 
 async def process_file(path, parent, fsid, islink):
     """Process a file.
@@ -204,9 +208,10 @@ async def process_file(path, parent, fsid, islink):
         await set_dirent_version(path, parent, fsid, stat, Kind.SYMLINK)
         processing_db.remove(path)
         logging.info(f"Processed symlink: {path}")
+        cofnfig['num_tasks'] -= 1
         return
 
-    version_wor_id, contents_changed = 1, True
+    version_row_id, contents_changed = 1, True
     _, version_row_id, contents_changed, is_hardlink = \
         await set_dirent_version(path, parent, fsid, stat, Kind.FILE)
     if not contents_changed or is_hardlink:  # no update to file contents?
@@ -237,10 +242,12 @@ async def process_file(path, parent, fsid, islink):
             async with config['db_pool'].acquire() as db:
                 ver_object_row = await db.fetchrow("SELECT * FROM ver_object WHERE object_hash=$1", object_hash)
                 # find an ver_object_row -> same content object is in S3
-                await db.execute(
-                    "INSERT INTO ver_object (ver_id, object_hash) VALUES ($1, $2)",
-                    version_row_id, object_hash)
+                if not ver_object_row and size != 0:
+                    await db.execute(
+                        "INSERT INTO ver_object (ver_id, object_hash) VALUES ($1, $2)",
+                        version_row_id, object_hash)
             if not ver_object_row and size != 0:
+                config['num_tasks'] += 1
                 task = asyncio.create_task(
                     write_to_s3(chunk_index, path, object_hash, size, prev_contents))
                 task_list.append(task)
@@ -250,8 +257,8 @@ async def process_file(path, parent, fsid, islink):
     processing_db.remove(path)
     logging.info(
         f"Processed file: (db:{len(processing_db)},s3:{len(processing_s3)})")
-    config['num_tasks'] -= 1
     config['processed_files'] += 1
+    config['num_tasks'] -= 1
 
 
 async def process_dir(path, parent):
@@ -270,6 +277,7 @@ async def process_dir(path, parent):
     processing_db.remove(path)
     if is_hardlink:
         logging.info(f"hard link for dir: {path}")
+        config['num_tasks'] -= 1
         return
 
     # create tasks for dirs and files in the directory
@@ -296,6 +304,7 @@ async def process_dir(path, parent):
         else:
             logging.info(f"Not file or dir: {dent.path}  Skipped")
     logging.info(f"Processed dir: {path}")
+    config['num_tasks'] -= 1
 
 
 async def shutdown(signal, loop):
@@ -385,7 +394,7 @@ async def async_backup():
             id SERIAL PRIMARY KEY,
             is_delmarker integer NOT NULL,
             name text NOT NULL,
-            size integer NOT NULL,
+            size bigint NOT NULL,
             ctime timestamp NOT NULL,
             mtime timestamp NOT NULL,
             atime timestamp NOT NULL,
@@ -422,9 +431,10 @@ async def async_backup():
     task = asyncio.create_task(process_dir(config['root_dir'], -1))
     task_list.append(task)
     await asyncio.sleep(1)  # wait a while for task_list to be populated
-    while processing_db or processing_s3:
-        await asyncio.sleep(0.5)
-    await asyncio.sleep(1)  # wait a while for task_list to be populated
+    while config['num_tasks'] > 0:
+        logging.info(f"Waiting tasks: {config['num_tasks']}")
+        await asyncio.sleep(1)
+    # await asyncio.sleep(1)  # wait a while for task_list to be populated
     await asyncio.gather(*task_list)
 
     # Take care of deleted files and directories
@@ -451,7 +461,7 @@ async def async_backup():
         await s3.upload_file(
             config['db_endpoint'], config['s3_bucket'], obj_name)
     """
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
     for s3 in config['s3_pool']:
         await s3.close()
 
@@ -639,8 +649,8 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
             #logging.info(f"hlink dict set: {fpath}")
             hardlink_dict[fsid_inode] = fpath
 
-    config['num_tasks'] -= 1
     config['processed_files'] += 1
+    config['num_tasks'] -= 1
 
 
 async def async_restore():
@@ -703,12 +713,12 @@ async def async_restore():
                         parent_id, kind))
         task_list.append(task)
         await asyncio.sleep(1)
-        while processing_db or processing_s3:
-            #logging.info(f"Waiting tasks: {processing_db}, {processing_s3}")
+        while config['num_tasks'] > 0:
+            logging.info(f"Waiting tasks: {config['num_tasks']}")
             await asyncio.sleep(1)
-        await asyncio.sleep(3)
+        # await asyncio.sleep(1)
         await asyncio.gather(*task_list)
-        await asyncio.sleep(2)
+        # await asyncio.sleep(1)
 
 
 def main():
@@ -791,7 +801,7 @@ def main():
         logging.info("Completed or gracefully terminated")
     config['end_time'] = datetime.datetime.now()
     print(
-        f"Processed {config['processed_files']} files ({config['processed_files']/((config['end_time']-config['start_time']).total_seconds()-5)} files/sec)")
+        f"Processed {config['processed_files']} files ({config['processed_files']/((config['end_time']-config['start_time']).total_seconds())} files/sec)")
 
 
 if __name__ == "__main__":
