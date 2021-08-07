@@ -97,7 +97,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 5.  psql
 
 
-    ALTER USER postgres PASSWORD '<db-password>';
+    ALTER USER postgres PASSWORD '{db-password}';
 
 
 <a id="org3a4c310"></a>
