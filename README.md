@@ -1,21 +1,21 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#org0937ef8)
-    1.  [Overview](#org9276a90)
-    2.  [Getting started](#org7a33ce6)
-        1.  [Prerequisites](#org563c3c8)
-        2.  [Installation](#org6f5fa12)
-        3.  [FYI; Postgres config for Fedora/CentOS](#org29bb405)
-        4.  [Configuration file](#orge63d634)
-        5.  [Usage](#org4fc1b98)
-2.  [License](#org7eed7df)
-3.  [Contact](#org6b7c4f2)
-4.  [Acknowledgements](#org7e3cf75)
+1.  [bus3 - buckup to S3](#org5b4d2b3)
+    1.  [Overview](#org3e5e1b1)
+    2.  [Getting started](#orge0a9a39)
+        1.  [Prerequisites](#org0230581)
+        2.  [Installation](#org065d0c9)
+        3.  [FYI; Postgres config for Fedora/CentOS](#org8616237)
+        4.  [Configuration file](#org8a6e601)
+        5.  [Usage](#org2ad2a5c)
+2.  [License](#orgb4a82ce)
+3.  [Contact](#org6b1bfe1)
+4.  [Acknowledgements](#org03e6acb)
 
 
 
-<a id="org0937ef8"></a>
+<a id="org5b4d2b3"></a>
 
 # bus3 - buckup to S3
 
@@ -24,7 +24,7 @@
 **Important notice** - bus3 is still under development (experimental) and may or may not work for now.  
 
 
-<a id="org9276a90"></a>
+<a id="org3e5e1b1"></a>
 
 ## Overview
 
@@ -43,12 +43,12 @@ bus3 is designed so that it is supposed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in database.  The database is also backed up to S3 storage.
 
 
-<a id="org7a33ce6"></a>
+<a id="orge0a9a39"></a>
 
 ## Getting started
 
 
-<a id="org563c3c8"></a>
+<a id="org0230581"></a>
 
 ### Prerequisites
 
@@ -62,7 +62,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 -   Maybe need root priviledge to execute
 
 
-<a id="org6f5fa12"></a>
+<a id="org065d0c9"></a>
 
 ### Installation
 
@@ -78,7 +78,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 10. Run `python bus3.py -b` to backup
 
 
-<a id="org29bb405"></a>
+<a id="org8616237"></a>
 
 ### FYI; Postgres config for Fedora/CentOS
 
@@ -98,7 +98,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
     ALTER USER postgres PASSWORD '<db-password>';
 
 
-<a id="orge63d634"></a>
+<a id="org8a6e601"></a>
 
 ### Configuration file
 
@@ -110,7 +110,7 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="org4fc1b98"></a>
+<a id="org2ad2a5c"></a>
 
 ### Usage
 
@@ -145,24 +145,17 @@ To restore directory/file:
 
 If `<backup-history-number>` is not specified, bus3 will restore the latest version.
 
-To restore database file:
-
-    python bus3.py --restore_database [<negative number>]
-
-`<negative number>` is -1, -2, etc. and indicates relative version number from the latest.  For example, '-1' is the 2nd latest and '-2' is the 3rd latest.
-
-Note:
-If bus3.py doesn't find the database file (bus3.db) in the current directory when it performs a backup (`-b`), it will create a new one.
+Important: Please make sure to backup database after backup files/directories with bus3.py.
 
 
-<a id="org7eed7df"></a>
+<a id="orgb4a82ce"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="org6b7c4f2"></a>
+<a id="org6b1bfe1"></a>
 
 # Contact
 
@@ -171,7 +164,7 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="org7e3cf75"></a>
+<a id="org03e6acb"></a>
 
 # Acknowledgements
 

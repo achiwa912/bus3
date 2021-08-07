@@ -26,7 +26,7 @@ config = {
     's3_max': 256,  # max number of S3 tasks
     'db_max': 256,  # max number of db tasks
     'lb_max': 16,  # max number of tasks using large buffers
-    's3_pool_size': 8,  # S3 client pool size
+    's3_pool_size': 64,  # S3 client pool size
     'restore_max': 256,  # max concurrent restore tasks
     'db_timeout': 180,  # timeout value
     'db_password': 'bus3pass',
@@ -79,7 +79,6 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
 
         is_hardlink = False  # hard link flag
         # dirent table
-        logging.info(f"dirent for path: {path}")
         dirent_row = await db.fetchrow(
             "SELECT * FROM dirent WHERE fsid=$1 AND inode=$2",
             fsid, stat.st_ino)
@@ -102,7 +101,6 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
         link_path = ""
         if kind == Kind.SYMLINK:
             link_path = os.readlink(path)
-        logging.info(f"version for path: {path}")
         version_row = await db.fetchrow(
             "SELECT * FROM version WHERE dirent_id=$1 ORDER BY id DESC",
             dirent_row_id)
@@ -111,7 +109,6 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
             names = os.listxattr(path, follow_symlinks=False)
             for name in names:
                 xattrdic[name] = os.getxattr(path, name, follow_symlinks=False)
-            logging.info(f"Inserting ver_row for dirent - {dirent_row_id}")
             version_row_id = await db.fetchval(
                 "INSERT INTO version (is_delmarker, name, size, ctime, mtime, atime, permission, uid, gid, link_path, xattr, dirent_id, scan_counter, parent_id, is_hardlink) VALUES (0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
                 os.path.basename(path), stat.st_size,
@@ -801,7 +798,7 @@ def main():
         logging.info("Completed or gracefully terminated")
     config['end_time'] = datetime.datetime.now()
     print(
-        f"Processed {config['processed_files']} files ({config['processed_files']/((config['end_time']-config['start_time']).total_seconds())} files/sec)")
+        f"Processed {config['processed_files']-1} files ({(config['processed_files']-1)/((config['end_time']-config['start_time']).total_seconds())} files/sec)")
 
 
 if __name__ == "__main__":
