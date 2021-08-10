@@ -25,7 +25,7 @@ config = {
     'buffersize': 256*1024,  # buffer size for hash calculation (256KB)
     's3_max': 256,  # max number of S3 tasks
     'db_max': 256,  # max number of db tasks
-    'lb_max': 16,  # max number of tasks using large buffers
+    'lb_max': 32,  # max number of tasks using large buffers
     's3_pool_size': 64,  # S3 client pool size
     'restore_max': 256,  # max concurrent restore tasks
     'db_timeout': 180,  # timeout value
@@ -41,6 +41,7 @@ config = {
     'restore_version': 0,  # optional restore version
     'num_tasks': 0,  # number of tasks
     'processed_files': 0,  # number of processed files
+    'processed_size': 0,  # total size of processed files
     'start_time': 0,
     'end_time': 0,
     'db_pool': None,  # database connection pool
@@ -255,6 +256,7 @@ async def process_file(path, parent, fsid, islink):
     logging.info(
         f"Processed file: (db:{len(processing_db)},s3:{len(processing_s3)})")
     config['processed_files'] += 1
+    config['processed_size'] += stat.st_size
     config['num_tasks'] -= 1
 
 
@@ -542,7 +544,7 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
             else:
                 hardlink_dict[fsid_inode] = None
         verobjs = await db.fetch(
-            "SELECT * FROM ver_object WHERE ver_id=$1", ver_id)
+            "SELECT * FROM ver_object WHERE ver_id=$1 ORDER BY id", ver_id)
         if kind == Kind.DIRECTORY and not is_hardlink:
             # Get children to dispatch
             children_rows = await db.fetch("SELECT d.id, v.id, v.name, v.parent_id, d.type, v.is_delmarker, MAX(v.scan_counter) FROM dirent d JOIN version v ON d.id=v.dirent_id WHERE (SELECT dirent_id FROM version WHERE id = v.parent_id) = $1 AND v.scan_counter <= $2 GROUP BY v.name, d.id, v.id ORDER BY v.scan_counter DESC", dent_id, config['restore_version'])
@@ -646,7 +648,9 @@ async def restore_obj(restore_to, dent_id, ver_id, parent_id, kind):
             #logging.info(f"hlink dict set: {fpath}")
             hardlink_dict[fsid_inode] = fpath
 
-    config['processed_files'] += 1
+    if kind == Kind.FILE and not process_hardlink:
+        config['processed_files'] += 1
+        config['processed_size'] += ver_row[3]  # file size
     config['num_tasks'] -= 1
 
 
@@ -797,9 +801,10 @@ def main():
         loop.close()
         logging.info("Completed or gracefully terminated")
     config['end_time'] = datetime.datetime.now()
-    print(
-        f"Processed {config['processed_files']-1} files ({(config['processed_files']-1)/((config['end_time']-config['start_time']).total_seconds())} files/sec)")
-
+    elapsed_seconds = (config['end_time'] - config['start_time']).total_seconds()
+    print(f"Processed {config['processed_files']} files in {elapsed_seconds} seconds.")
+    print(f" {config['processed_files']/elapsed_seconds} files/sec")
+    print(f" {config['processed_size']/elapsed_seconds/1024/1024} MB/s")
 
 if __name__ == "__main__":
     main()
