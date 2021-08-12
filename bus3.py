@@ -25,7 +25,8 @@ config = {
     'buffersize': 256*1024,  # buffer size for hash calculation (256KB)
     's3_max': 256,  # max number of S3 tasks
     'db_max': 256,  # max number of db tasks
-    'lb_max': 32,  # max number of tasks using large buffers
+    'lb_max': 16,  # max number of tasks using large buffers
+    'buf_max': 1*1024*1024*1024,  # max memory usage with buffers
     's3_pool_size': 64,  # S3 client pool size
     'restore_max': 256,  # max concurrent restore tasks
     'db_timeout': 180,  # timeout value
@@ -40,6 +41,7 @@ config = {
     'restore_to': None,  # restore to directory
     'restore_version': 0,  # optional restore version
     'num_tasks': 0,  # number of tasks
+    'sum_buffers': 0,  # total used memory for buffers
     'processed_files': 0,  # number of processed files
     'processed_size': 0,  # total size of processed files
     'start_time': 0,
@@ -142,52 +144,33 @@ async def set_dirent_version(path, parent, fsid, stat, kind):
     return dirent_row_id, version_row_id, contents_changed, is_hardlink
 
 
-async def write_to_s3(chunk_index, file_path, object_hash, size, contents):
+async def write_to_s3(file_path, object_hash, view):
     """Create an S3 object
 
     Args:
-        chunk_index: (if file size > chunk size)
         file_path
         object_hash: will be object key name
-        size: object size
-        contents: full contents if size <= buffer size 
-                  (ie, don't need to read file again)
+        view: memoryview of full contents (up to chunk size)
     """
     processing_s3.append(file_path)
+    out_flag = False
     while not config['s3_pool']:
+        if not out_flag:
+            logging.info(f"waiting for S3 obj")
+            out_flag = True
         await asyncio.sleep(0.5)
     s3 = config['s3_pool'].pop()
 
-    if size <= config['buffersize']:
-        view = memoryview(contents)
-        fo = io.BytesIO(view)
-        await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
-        config['s3_pool'].append(s3)  # put S3 client back to pool
-        processing_s3.remove(file_path)
-        del view
-        del contents
-        config['num_tasks'] -= 1
-        return
-
-    while config['large_buffers'] >= config['lb_max']:
-        await asyncio.sleep(1)
-    config['large_buffers'] += 1
-    logging.info(f"Grab a large buffer: {size}")
-    large_buffer = bytearray(size)
-    view = memoryview(large_buffer)
-    async with aiofiles.open(file_path, mode='rb') as f:
-        await f.seek(chunk_index * config['chunksize'])
-        await f.readinto(view)
-        fo = io.BytesIO(view)
-        await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
-    del view
-    del large_buffer
-    config['large_buffers'] -= 1
+    # logging.info(f"writing to S3 - {file_path}:{object_hash}")
+    fo = io.BytesIO(view)
+    await s3.upload_fileobj(fo, config['s3_bucket'], object_hash)
     config['s3_pool'].append(s3)  # put S3 client back to pool
+
     processing_s3.remove(file_path)
-    logging.info(
-        f"Processed s3 write: {file_path} (db:{len(processing_db)},s3:{len(processing_s3)})")
+    config['sum_buffers'] -= len(view)
+    view.release()
     config['num_tasks'] -= 1
+    return
 
 async def process_file(path, parent, fsid, islink):
     """Process a file.
@@ -221,36 +204,39 @@ async def process_file(path, parent, fsid, islink):
 
     chunksize = config['chunksize']
     bufsize = config['buffersize']
+    remaining_size = stat.st_size
     async with aiofiles.open(path, mode='rb') as f:
         chunk_index = 0
-        eof = False  # end of file
-        while True:  # create chunks
+        while remaining_size:
             hash_val = hashlib.sha256()
-            size = 0
-            contents = prev_contents = b''
-            while size < chunksize:  # calculate hash for the file or up to chunk size
-                contents = await f.read(bufsize)
-                size += len(contents)
-                if not contents:
-                    eof = True
-                    break
-                hash_val.update(contents)
-                prev_contents = contents
+            readsize = min(remaining_size, chunksize)
+            log_out = False
+            while config['sum_buffers'] + readsize > config['buf_max']:
+                if not log_out:
+                    logging.info(f"wait for buf: {path}:{chunk_index}")
+                    log_out = True  # only once
+                await asyncio.sleep(0.1)
+            config['sum_buffers'] += readsize
+            contents = await f.read(readsize)
+            view = memoryview(contents)
+            # remaining_size -= len(view)
+            hash_val.update(view)
             object_hash = hash_val.hexdigest()
+            
             async with config['db_pool'].acquire() as db:
                 ver_object_row = await db.fetchrow("SELECT * FROM ver_object WHERE object_hash=$1", object_hash)
                 # find an ver_object_row -> same content object is in S3
-                if not ver_object_row and size != 0:
+                if not ver_object_row and len(view):
                     await db.execute(
                         "INSERT INTO ver_object (ver_id, object_hash) VALUES ($1, $2)",
                         version_row_id, object_hash)
-            if not ver_object_row and size != 0:
+            if not ver_object_row and len(view):
                 config['num_tasks'] += 1
+                logging.info(f"spawn write to S3 task: {path}:{chunk_index}")
                 task = asyncio.create_task(
-                    write_to_s3(chunk_index, path, object_hash, size, prev_contents))
+                    write_to_s3(path, object_hash, view))
                 task_list.append(task)
-            if eof:
-                break
+            remaining_size -= len(view)
             chunk_index += 1
     processing_db.remove(path)
     logging.info(
