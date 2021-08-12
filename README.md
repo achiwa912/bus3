@@ -1,24 +1,25 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#org788b70b)
-    1.  [Overview](#org23aad41)
-    2.  [Getting started](#orgb29f1c8)
-        1.  [Prerequisites](#orge06d251)
-        2.  [Installation](#orga09f549)
-        3.  [FYI; Postgres config for Fedora/CentOS](#org4f9ba88)
-        4.  [Configuration file](#org3704590)
-        5.  [Usage](#org052f2a0)
-2.  [License](#orgfd831cc)
-3.  [Contact](#orgdecdab7)
-4.  [Acknowledgements](#orgaa911ae)
-5.  [Appendix; Performance testing](#org2a75d86)
-    1.  [Small random files (4KB)](#org789f56f)
-    2.  [large random files (1 or 4GB)](#org65efd41)
+1.  [bus3 - buckup to S3](#orge20ce20)
+    1.  [Overview](#org423c3d4)
+    2.  [Getting started](#org8d4cc8c)
+        1.  [Prerequisites](#org85b4e25)
+        2.  [Installation](#org86e4e6a)
+        3.  [FYI; Postgres config for Fedora/CentOS](#org8435045)
+        4.  [Configuration file](#orgebb7035)
+        5.  [Usage](#orgdfc5178)
+2.  [License](#org3634a6b)
+3.  [Contact](#orgfd1b180)
+4.  [Acknowledgements](#orgc777c02)
+5.  [Appendix A; Past improvements](#org3eb91d2)
+6.  [Appendix B; Performance testing](#orge0bea12)
+    1.  [Small random files (4KB)](#org699acb9)
+    2.  [large random files (1 or 4GB)](#orgfe3f2e9)
 
 
 
-<a id="org788b70b"></a>
+<a id="orge20ce20"></a>
 
 # bus3 - buckup to S3
 
@@ -27,7 +28,7 @@
 **Important notice** - bus3 is still under development (experimental) and may or may not work for now.  
 
 
-<a id="org23aad41"></a>
+<a id="org423c3d4"></a>
 
 ## Overview
 
@@ -47,12 +48,12 @@ bus3 is designed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in the database.  The database needs to be backed up separately after each backup.
 
 
-<a id="orgb29f1c8"></a>
+<a id="org8d4cc8c"></a>
 
 ## Getting started
 
 
-<a id="orge06d251"></a>
+<a id="org85b4e25"></a>
 
 ### Prerequisites
 
@@ -66,7 +67,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 -   May need root priviledge to execute
 
 
-<a id="orga09f549"></a>
+<a id="org86e4e6a"></a>
 
 ### Installation
 
@@ -82,7 +83,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 10. Run `python bus3.py -b` to backup
 
 
-<a id="org4f9ba88"></a>
+<a id="org8435045"></a>
 
 ### FYI; Postgres config for Fedora/CentOS
 
@@ -102,7 +103,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
     ALTER USER postgres PASSWORD '<db-password>';
 
 
-<a id="org3704590"></a>
+<a id="orgebb7035"></a>
 
 ### Configuration file
 
@@ -114,7 +115,7 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="org052f2a0"></a>
+<a id="orgdfc5178"></a>
 
 ### Usage
 
@@ -152,14 +153,14 @@ If `<backup-history-number>` is not specified, bus3 will restore the latest vers
 Important: Please make sure to backup database after each backup files/directories with bus3.py.
 
 
-<a id="orgfd831cc"></a>
+<a id="org3634a6b"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="orgdecdab7"></a>
+<a id="orgfd1b180"></a>
 
 # Contact
 
@@ -168,21 +169,73 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="orgaa911ae"></a>
+<a id="orgc777c02"></a>
 
 # Acknowledgements
 
 TBD
 
 
-<a id="org2a75d86"></a>
+<a id="org3eb91d2"></a>
 
-# Appendix; Performance testing
+# Appendix A; Past improvements
+
+<table border="2" cellspacing="0" cellpadding="6" rules="groups" frame="hsides">
+
+
+<colgroup>
+<col  class="org-left" />
+
+<col  class="org-left" />
+
+<col  class="org-left" />
+</colgroup>
+<tbody>
+<tr>
+<td class="org-left">improvement</td>
+<td class="org-left">supported</td>
+<td class="org-left">comment</td>
+</tr>
+
+
+<tr>
+<td class="org-left">Switch from sqlite3 to postgres</td>
+<td class="org-left">yes</td>
+<td class="org-left">&#xa0;</td>
+</tr>
+
+
+<tr>
+<td class="org-left">Create DB pool</td>
+<td class="org-left">yes</td>
+<td class="org-left">&#xa0;</td>
+</tr>
+
+
+<tr>
+<td class="org-left">Create S3 client pool</td>
+<td class="org-left">yes</td>
+<td class="org-left">&#xa0;</td>
+</tr>
+
+
+<tr>
+<td class="org-left">Reduce local file reads</td>
+<td class="org-left">no</td>
+<td class="org-left">Performance didn't change but increased memory utilization</td>
+</tr>
+</tbody>
+</table>
+
+
+<a id="orge0bea12"></a>
+
+# Appendix B; Performance testing
 
 Conducted performance test in a local environment with a locally connected S3 storage (ie, **NOT** Amazon AWS).
 
 
-<a id="org789f56f"></a>
+<a id="org699acb9"></a>
 
 ## Small random files (4KB)
 
@@ -295,7 +348,7 @@ Backed up and restored 1000 4KB random files in a directory.
 </table>
 
 
-<a id="org65efd41"></a>
+<a id="orgfe3f2e9"></a>
 
 ## large random files (1 or 4GB)
 
