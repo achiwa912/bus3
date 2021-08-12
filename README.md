@@ -1,38 +1,41 @@
 
 # Table of Contents
 
-1.  [bus3 - buckup to S3](#org1e672a0)
-    1.  [Overview](#org11746c1)
-    2.  [Getting started](#orgeac1f73)
-        1.  [Prerequisites](#org37d1924)
-        2.  [Installation](#orga98f00a)
-        3.  [FYI; Postgres config for Fedora/CentOS](#org5e709a6)
-        4.  [Configuration file](#org3a4c310)
-        5.  [Usage](#org1b98c02)
-2.  [License](#orgdf71267)
-3.  [Contact](#org678c9d3)
-4.  [Acknowledgements](#org867aebf)
+1.  [bus3 - buckup to S3](#org788b70b)
+    1.  [Overview](#org23aad41)
+    2.  [Getting started](#orgb29f1c8)
+        1.  [Prerequisites](#orge06d251)
+        2.  [Installation](#orga09f549)
+        3.  [FYI; Postgres config for Fedora/CentOS](#org4f9ba88)
+        4.  [Configuration file](#org3704590)
+        5.  [Usage](#org052f2a0)
+2.  [License](#orgfd831cc)
+3.  [Contact](#orgdecdab7)
+4.  [Acknowledgements](#orgaa911ae)
+5.  [Appendix; Performance testing](#org2a75d86)
+    1.  [Small random files (4KB)](#org789f56f)
+    2.  [large random files (1 or 4GB)](#org65efd41)
 
 
 
-<a id="org1e672a0"></a>
+<a id="org788b70b"></a>
 
 # bus3 - buckup to S3
 
-`bus3.py` is a backup tool to S3 storage.  It fully utilizes `asyncio` to maximize concurrency.  It relies on `aiofiles`, `asyncpg` and `aioboto3` libraries.
+`bus3.py` is an experimental backup tool to S3 storage.  It fully utilizes `asyncio` to maximize concurrency with small footprint.  It relies on `aiofiles`, `asyncpg` and `aioboto3` libraries.
 
 **Important notice** - bus3 is still under development (experimental) and may or may not work for now.  
 
 
-<a id="org11746c1"></a>
+<a id="org23aad41"></a>
 
 ## Overview
 
-bus3 is designed so that it is supposed to be able to:
+bus3 is designed to be able to:
 
 -   backup files, directories and symbolic/hard links
 -   preserve extended attributes
--   track backup history
+-   track backup history and file versions
 -   perform file or chunk (default 64MB) level dedupe
 -   backup very large files without using up all the memory
 -   handle a large number of files without using up memory
@@ -44,12 +47,12 @@ bus3 is designed so that it is supposed to be able to:
 bus3 splits large files into chunks and stores them as separate objects in S3 storage.  It stores file metadata in the database.  The database needs to be backed up separately after each backup.
 
 
-<a id="orgeac1f73"></a>
+<a id="orgb29f1c8"></a>
 
 ## Getting started
 
 
-<a id="org37d1924"></a>
+<a id="orge06d251"></a>
 
 ### Prerequisites
 
@@ -63,7 +66,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 -   May need root priviledge to execute
 
 
-<a id="orga98f00a"></a>
+<a id="orga09f549"></a>
 
 ### Installation
 
@@ -79,7 +82,7 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 10. Run `python bus3.py -b` to backup
 
 
-<a id="org5e709a6"></a>
+<a id="org4f9ba88"></a>
 
 ### FYI; Postgres config for Fedora/CentOS
 
@@ -96,11 +99,10 @@ bus3 splits large files into chunks and stores them as separate objects in S3 st
 4.  createdb bus3
 5.  psql
 
+    ALTER USER postgres PASSWORD '<db-password>';
 
-    ALTER USER postgres PASSWORD '{db-password}';
 
-
-<a id="org3a4c310"></a>
+<a id="org3704590"></a>
 
 ### Configuration file
 
@@ -112,7 +114,7 @@ bus3.yaml is the configuration file.
       s3_endpoint: https://<S3-storage-URL>:<port>
 
 
-<a id="org1b98c02"></a>
+<a id="org052f2a0"></a>
 
 ### Usage
 
@@ -150,14 +152,14 @@ If `<backup-history-number>` is not specified, bus3 will restore the latest vers
 Important: Please make sure to backup database after each backup files/directories with bus3.py.
 
 
-<a id="orgdf71267"></a>
+<a id="orgfd831cc"></a>
 
 # License
 
 bus3.py is under [MIT license](https://en.wikipedia.org/wiki/MIT_License).
 
 
-<a id="org678c9d3"></a>
+<a id="orgdecdab7"></a>
 
 # Contact
 
@@ -166,9 +168,222 @@ Kyosuke Achiwa - @kyos\_achwan - achiwa912+gmail.com (please replace `+` with `@
 Project Link: <https://github.com/achiwa912/bus3>
 
 
-<a id="org867aebf"></a>
+<a id="orgaa911ae"></a>
 
 # Acknowledgements
 
 TBD
+
+
+<a id="org2a75d86"></a>
+
+# Appendix; Performance testing
+
+Conducted performance test in a local environment with a locally connected S3 storage (ie, **NOT** Amazon AWS).
+
+
+<a id="org789f56f"></a>
+
+## Small random files (4KB)
+
+Backed up and restored 1000 4KB random files in a directory.
+
+<table border="2" cellspacing="0" cellpadding="6" rules="groups" frame="hsides">
+
+
+<colgroup>
+<col  class="org-right" />
+
+<col  class="org-right" />
+
+<col  class="org-right" />
+
+<col  class="org-right" />
+
+<col  class="org-right" />
+</colgroup>
+<tbody>
+<tr>
+<td class="org-right">S3 pool size</td>
+<td class="org-right">max S3 tasks</td>
+<td class="org-right">max DB tasks</td>
+<td class="org-right">backup (files/sec)</td>
+<td class="org-right">restore (files/sec)</td>
+</tr>
+
+
+<tr>
+<td class="org-right">150</td>
+<td class="org-right">150</td>
+<td class="org-right">96</td>
+<td class="org-right">45.2</td>
+<td class="org-right">59.9</td>
+</tr>
+
+
+<tr>
+<td class="org-right">150</td>
+<td class="org-right">150</td>
+<td class="org-right">150</td>
+<td class="org-right">61.1</td>
+<td class="org-right">59.1</td>
+</tr>
+
+
+<tr>
+<td class="org-right">150</td>
+<td class="org-right">150</td>
+<td class="org-right">256</td>
+<td class="org-right">60.9</td>
+<td class="org-right">62.7</td>
+</tr>
+
+
+<tr>
+<td class="org-right">256</td>
+<td class="org-right">256</td>
+<td class="org-right">256</td>
+<td class="org-right">61.8</td>
+<td class="org-right">59.5</td>
+</tr>
+
+
+<tr>
+<td class="org-right">96</td>
+<td class="org-right">256</td>
+<td class="org-right">256</td>
+<td class="org-right">65.8</td>
+<td class="org-right">58.3</td>
+</tr>
+
+
+<tr>
+<td class="org-right">64</td>
+<td class="org-right">256</td>
+<td class="org-right">256</td>
+<td class="org-right">66.9</td>
+<td class="org-right">63.0</td>
+</tr>
+
+
+<tr>
+<td class="org-right">32</td>
+<td class="org-right">256</td>
+<td class="org-right">256</td>
+<td class="org-right">63.9</td>
+<td class="org-right">60.0</td>
+</tr>
+
+
+<tr>
+<td class="org-right">16</td>
+<td class="org-right">256</td>
+<td class="org-right">256</td>
+<td class="org-right">46.5</td>
+<td class="org-right">59.4</td>
+</tr>
+
+
+<tr>
+<td class="org-right">8</td>
+<td class="org-right">256</td>
+<td class="org-right">256</td>
+<td class="org-right">37.9</td>
+<td class="org-right">62.7</td>
+</tr>
+</tbody>
+</table>
+
+
+<a id="org65efd41"></a>
+
+## large random files (1 or 4GB)
+
+<table border="2" cellspacing="0" cellpadding="6" rules="groups" frame="hsides">
+
+
+<colgroup>
+<col  class="org-right" />
+
+<col  class="org-right" />
+
+<col  class="org-right" />
+
+<col  class="org-right" />
+
+<col  class="org-right" />
+</colgroup>
+<tbody>
+<tr>
+<td class="org-right">file size (GB)</td>
+<td class="org-right">files</td>
+<td class="org-right">max large buffers</td>
+<td class="org-right">backup (MB/s)</td>
+<td class="org-right">restore (MB/s)</td>
+</tr>
+
+
+<tr>
+<td class="org-right">4</td>
+<td class="org-right">2</td>
+<td class="org-right">16</td>
+<td class="org-right">57.57</td>
+<td class="org-right">88.68</td>
+</tr>
+
+
+<tr>
+<td class="org-right">1</td>
+<td class="org-right">1</td>
+<td class="org-right">16</td>
+<td class="org-right">57.5</td>
+<td class="org-right">92.53</td>
+</tr>
+
+
+<tr>
+<td class="org-right">1</td>
+<td class="org-right">2</td>
+<td class="org-right">16</td>
+<td class="org-right">55.15</td>
+<td class="org-right">78.18</td>
+</tr>
+
+
+<tr>
+<td class="org-right">1</td>
+<td class="org-right">4</td>
+<td class="org-right">16</td>
+<td class="org-right">56.29</td>
+<td class="org-right">88.63</td>
+</tr>
+
+
+<tr>
+<td class="org-right">1</td>
+<td class="org-right">8</td>
+<td class="org-right">16</td>
+<td class="org-right">56.8</td>
+<td class="org-right">93.79</td>
+</tr>
+
+
+<tr>
+<td class="org-right">1</td>
+<td class="org-right">8</td>
+<td class="org-right">32</td>
+<td class="org-right">56.48</td>
+<td class="org-right">90.69</td>
+</tr>
+
+
+<tr>
+<td class="org-right">1</td>
+<td class="org-right">16</td>
+<td class="org-right">32</td>
+<td class="org-right">54.73</td>
+<td class="org-right">91.09</td>
+</tr>
+</tbody>
+</table>
 
